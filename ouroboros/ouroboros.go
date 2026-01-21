@@ -1,4 +1,4 @@
-// Copyright 2025 Blink Labs Software
+// Copyright 2026 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,6 +41,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// maxChainsyncClients is the maximum number of concurrent chainsync clients.
+const maxChainsyncClients = 10
+
 type Ouroboros struct {
 	ConnManager      *connmanager.ConnectionManager
 	PeerGov          *peergov.PeerGovernor
@@ -52,6 +55,15 @@ type Ouroboros struct {
 	metrics          *blockfetchMetrics
 	blockFetchStarts map[ouroboros.ConnectionId]time.Time
 	blockFetchMutex  sync.Mutex
+	// ChainSync measurement tracking for peer scoring
+	chainsyncStats map[ouroboros.ConnectionId]*chainsyncPeerStats
+	chainsyncMutex sync.Mutex
+}
+
+// chainsyncPeerStats tracks ChainSync performance metrics per peer connection.
+type chainsyncPeerStats struct {
+	lastObservationTime time.Time
+	headerCount         int64
 }
 
 type OuroborosConfig struct {
@@ -88,6 +100,7 @@ func NewOuroboros(cfg OuroborosConfig) *Ouroboros {
 		EventBus:         cfg.EventBus,
 		ConnManager:      cfg.ConnManager,
 		blockFetchStarts: make(map[ouroboros.ConnectionId]time.Time),
+		chainsyncStats:   make(map[ouroboros.ConnectionId]*chainsyncPeerStats),
 	}
 	if cfg.PromRegistry != nil {
 		o.initMetrics()
@@ -266,6 +279,10 @@ func (o *Ouroboros) HandleConnClosedEvent(evt event.Event) {
 	o.blockFetchMutex.Lock()
 	delete(o.blockFetchStarts, connId)
 	o.blockFetchMutex.Unlock()
+	// Clean up chainsync stats
+	o.chainsyncMutex.Lock()
+	delete(o.chainsyncStats, connId)
+	o.chainsyncMutex.Unlock()
 }
 
 func (o *Ouroboros) HandleOutboundConnEvent(evt event.Event) {
@@ -287,12 +304,13 @@ func (o *Ouroboros) HandleOutboundConnEvent(evt event.Event) {
 		o.PeerGov.UpdatePeerConnectionStability(connId, 1.0)
 	}
 
-	// TODO: replace this with handling for multiple chainsync clients (#385)
-	// Start chainsync client if we don't have another
+	// Start chainsync client for this connection if not already tracking it
 	if o.ChainsyncState != nil {
-		chainsyncClientConnId := o.ChainsyncState.GetClientConnId()
-		if chainsyncClientConnId == nil {
+		// Atomically check and add the client to avoid race conditions
+		if o.ChainsyncState.TryAddClientConnId(connId, maxChainsyncClients) {
 			if err := o.chainsyncClientStart(connId); err != nil {
+				// Roll back the registration on failure
+				o.ChainsyncState.RemoveClientConnId(connId)
 				o.config.Logger.Error(
 					"failed to start chainsync client",
 					"error",
@@ -300,7 +318,16 @@ func (o *Ouroboros) HandleOutboundConnEvent(evt event.Event) {
 				)
 				return
 			}
-			o.ChainsyncState.SetClientConnId(connId)
+			o.config.Logger.Debug(
+				"started chainsync client",
+				"connection_id", connId.String(),
+				"total_clients", o.ChainsyncState.ClientConnCount(),
+			)
+		} else if !o.ChainsyncState.HasClientConnId(connId) {
+			// Not already tracked and TryAdd failed means limit reached
+			o.config.Logger.Debug(
+				"chainsync client limit reached, skipping",
+			)
 		}
 	}
 	// Start txsubmission client

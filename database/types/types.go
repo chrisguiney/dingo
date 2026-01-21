@@ -91,6 +91,10 @@ var ErrNoStoreAvailable = errors.New("no store available")
 // ErrBlobStoreUnavailable is returned when blob store cannot be accessed
 var ErrBlobStoreUnavailable = errors.New("blob store unavailable")
 
+// ErrPartialCommit is returned when blob commits but metadata fails,
+// leaving the database in an inconsistent state that requires recovery.
+var ErrPartialCommit = errors.New("partial commit: blob committed but metadata failed")
+
 // BlobItem represents a value returned by an iterator
 type BlobItem interface {
 	Key() []byte
@@ -129,7 +133,10 @@ type Txn interface {
 	Rollback() error
 }
 
-// BlockMetadata contains metadata for a block stored in blob
+// BlockMetadata contains metadata for a block stored in blob.
+// IMPORTANT: Field order must remain [ID, Type, Height, PrevHash] because
+// cbor.StructAsArray encodes/decodes by position. Changing the order would
+// break deserialization of existing stored data.
 type BlockMetadata struct {
 	cbor.StructAsArray
 	ID       uint64

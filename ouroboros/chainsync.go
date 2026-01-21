@@ -1,4 +1,4 @@
-// Copyright 2025 Blink Labs Software
+// Copyright 2026 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/blinklabs-io/dingo/chain"
+	"github.com/blinklabs-io/dingo/chainselection"
 	"github.com/blinklabs-io/dingo/event"
 	"github.com/blinklabs-io/dingo/ledger"
 	ouroboros "github.com/blinklabs-io/gouroboros"
@@ -246,9 +249,10 @@ func (o *Ouroboros) chainsyncClientRollBackward(
 		event.NewEvent(
 			ledger.ChainsyncEventType,
 			ledger.ChainsyncEvent{
-				Rollback: true,
-				Point:    point,
-				Tip:      tip,
+				ConnectionId: ctx.ConnectionId,
+				Rollback:     true,
+				Point:        point,
+				Tip:          tip,
 			},
 		),
 	)
@@ -265,6 +269,21 @@ func (o *Ouroboros) chainsyncClientRollForward(
 	case gledger.BlockHeader:
 		blockSlot := v.SlotNumber()
 		blockHash := v.Hash().Bytes()
+		// Extract VRF output from block header for chain selection tie-breaking
+		vrfOutput := chainselection.GetVRFOutput(v)
+		// Publish peer tip update for chain selection
+		o.EventBus.Publish(
+			chainselection.PeerTipUpdateEventType,
+			event.NewEvent(
+				chainselection.PeerTipUpdateEventType,
+				chainselection.PeerTipUpdateEvent{
+					ConnectionId: ctx.ConnectionId,
+					Tip:          tip,
+					VRFOutput:    vrfOutput,
+				},
+			),
+		)
+		// Publish chainsync event for ledger processing
 		o.EventBus.Publish(
 			ledger.ChainsyncEventType,
 			event.NewEvent(
@@ -278,8 +297,80 @@ func (o *Ouroboros) chainsyncClientRollForward(
 				},
 			),
 		)
+		// Update ChainSync performance metrics for peer scoring
+		o.updateChainsyncMetrics(ctx.ConnectionId, tip)
 	default:
 		return fmt.Errorf("unexpected block data type: %T", v)
 	}
 	return nil
+}
+
+// updateChainsyncMetrics calculates and updates ChainSync performance metrics
+// for the given peer connection. This is called on each RollForward event.
+func (o *Ouroboros) updateChainsyncMetrics(
+	connId ouroboros.ConnectionId,
+	peerTip ochainsync.Tip,
+) {
+	if o.PeerGov == nil || o.LedgerState == nil {
+		return
+	}
+
+	now := time.Now()
+
+	// Get or create stats for this connection
+	o.chainsyncMutex.Lock()
+	stats, exists := o.chainsyncStats[connId]
+	if !exists {
+		stats = &chainsyncPeerStats{
+			lastObservationTime: now,
+			headerCount:         0,
+		}
+		o.chainsyncStats[connId] = stats
+	}
+
+	// Increment header count
+	stats.headerCount++
+
+	// Calculate header rate over the observation period
+	// We update the peer score periodically (at least 1 second between updates)
+	// to avoid excessive computation on every header
+	elapsed := now.Sub(stats.lastObservationTime)
+	if elapsed < time.Second {
+		o.chainsyncMutex.Unlock()
+		return
+	}
+
+	// Calculate headers per second
+	headerRate := float64(stats.headerCount) / elapsed.Seconds()
+
+	// Reset counters for next observation period
+	stats.headerCount = 0
+	stats.lastObservationTime = now
+	o.chainsyncMutex.Unlock()
+
+	// Calculate tip delta (our tip slot - peer's tip slot)
+	// Positive means peer is behind us, negative means peer is ahead
+	ourTip := o.LedgerState.Tip()
+	// Use signed subtraction to handle the delta correctly
+	// Slots are uint64, but the difference fits in int64 for reasonable cases
+	// Cap at math.MaxInt64 to avoid overflow
+	var tipDelta int64
+	if ourTip.Point.Slot >= peerTip.Point.Slot {
+		diff := ourTip.Point.Slot - peerTip.Point.Slot
+		if diff > math.MaxInt64 {
+			tipDelta = math.MaxInt64
+		} else {
+			tipDelta = int64(diff) //nolint:gosec // overflow handled above
+		}
+	} else {
+		diff := peerTip.Point.Slot - ourTip.Point.Slot
+		if diff > math.MaxInt64 {
+			tipDelta = math.MinInt64
+		} else {
+			tipDelta = -int64(diff) //nolint:gosec // overflow handled above
+		}
+	}
+
+	// Update peer scoring
+	o.PeerGov.UpdatePeerChainSyncObservation(connId, headerRate, tipDelta)
 }

@@ -91,7 +91,11 @@ func (c *ConnectionManager) startListener(
 	c.listenersMutex.Unlock()
 
 	// Build connection options
-	defaultConnOpts := make([]ouroboros.ConnectionOptionFunc, 0, 3+len(l.ConnectionOpts))
+	defaultConnOpts := make(
+		[]ouroboros.ConnectionOptionFunc,
+		0,
+		3+len(l.ConnectionOpts),
+	)
 	defaultConnOpts = append(defaultConnOpts,
 		ouroboros.WithLogger(c.config.Logger),
 		ouroboros.WithNodeToNode(!l.UseNtC),
@@ -169,6 +173,7 @@ func (c *ConnectionManager) startListener(
 						err,
 					),
 				)
+				conn.Close()
 				continue
 			}
 			// Add to connection manager

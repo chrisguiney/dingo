@@ -21,6 +21,7 @@ import (
 
 const (
 	ChainUpdateEventType = "chain.update"
+	ChainForkEventType   = "chain.fork-detected"
 )
 
 type ChainBlockEvent struct {
@@ -29,5 +30,19 @@ type ChainBlockEvent struct {
 }
 
 type ChainRollbackEvent struct {
-	Point ocommon.Point
+	Point            ocommon.Point
+	RolledBackBlocks []models.Block // Blocks that were rolled back, in reverse order (newest first)
+}
+
+// ChainForkEvent is emitted when a chain fork is detected.
+// This allows subscribers to monitor fork activity for alerting and metrics.
+type ChainForkEvent struct {
+	// ForkPoint is the common ancestor where the chains diverge
+	ForkPoint ocommon.Point
+	// ForkDepth is the number of blocks rolled back from the canonical chain
+	ForkDepth uint64
+	// AlternateHead is the tip of the competing chain
+	AlternateHead ocommon.Point
+	// CanonicalHead is the tip of the current canonical chain
+	CanonicalHead ocommon.Point
 }

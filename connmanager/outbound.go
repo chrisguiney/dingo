@@ -60,7 +60,11 @@ func (c *ConnectionManager) CreateOutboundConn(
 		return nil, err
 	}
 	// Build connection options
-	connOpts := make([]ouroboros.ConnectionOptionFunc, 0, 2+len(c.config.OutboundConnOpts))
+	connOpts := make(
+		[]ouroboros.ConnectionOptionFunc,
+		0,
+		2+len(c.config.OutboundConnOpts),
+	)
 	connOpts = append(connOpts,
 		ouroboros.WithConnection(tmpConn),
 		ouroboros.WithLogger(c.config.Logger),
@@ -78,6 +82,7 @@ func (c *ConnectionManager) CreateOutboundConn(
 		connOpts...,
 	)
 	if err != nil {
+		tmpConn.Close()
 		return nil, err
 	}
 	c.config.Logger.Info(

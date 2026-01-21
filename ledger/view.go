@@ -80,8 +80,19 @@ func (lv *LedgerView) StakeRegistration(
 func (lv *LedgerView) IsStakeCredentialRegistered(
 	cred lcommon.Credential,
 ) bool {
-	// TODO: implement stake credential registration check
-	return false
+	account, err := lv.ls.db.GetAccount(cred.Credential[:], false, lv.txn)
+	if err != nil {
+		if !errors.Is(err, models.ErrAccountNotFound) {
+			lv.ls.config.Logger.Error(
+				"failed to get account for stake credential",
+				"component", "ledger",
+				"credential", cred.Hash().String(),
+				"error", err,
+			)
+		}
+		return false
+	}
+	return account != nil && account.Active
 }
 
 // It returns the most recent active pool registration certificate
@@ -228,8 +239,19 @@ func (lv *LedgerView) UpdateAdaPots(adaPots lcommon.AdaPots) error {
 func (lv *LedgerView) IsRewardAccountRegistered(
 	cred lcommon.Credential,
 ) bool {
-	// TODO: implement reward account registration check
-	return false
+	account, err := lv.ls.db.GetAccount(cred.Credential[:], false, lv.txn)
+	if err != nil {
+		if !errors.Is(err, models.ErrAccountNotFound) {
+			lv.ls.config.Logger.Error(
+				"failed to get account for reward account",
+				"component", "ledger",
+				"credential", cred.Hash().String(),
+				"error", err,
+			)
+		}
+		return false
+	}
+	return account != nil && account.Active
 }
 
 // RewardAccountBalance returns the current reward balance for a stake credential

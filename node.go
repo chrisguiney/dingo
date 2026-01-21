@@ -1,4 +1,4 @@
-// Copyright 2025 Blink Labs Software
+// Copyright 2026 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/blinklabs-io/dingo/chain"
+	"github.com/blinklabs-io/dingo/chainselection"
 	"github.com/blinklabs-io/dingo/chainsync"
 	"github.com/blinklabs-io/dingo/connmanager"
 	"github.com/blinklabs-io/dingo/database"
@@ -31,12 +32,14 @@ import (
 	ouroborosPkg "github.com/blinklabs-io/dingo/ouroboros"
 	"github.com/blinklabs-io/dingo/peergov"
 	"github.com/blinklabs-io/dingo/utxorpc"
+	ouroboros "github.com/blinklabs-io/gouroboros"
 )
 
 type Node struct {
 	connManager    *connmanager.ConnectionManager
 	peerGov        *peergov.PeerGovernor
 	chainsyncState *chainsync.State
+	chainSelector  *chainselection.ChainSelector
 	eventBus       *event.EventBus
 	mempool        *mempool.Mempool
 	chainManager   *chain.ChainManager
@@ -74,6 +77,26 @@ func (n *Node) Run(ctx context.Context) error {
 		}
 	}
 	n.ctx, n.cancel = context.WithCancel(ctx)
+
+	// Track started components for cleanup on failure
+	var started []func()
+	success := false
+	defer func() {
+		r := recover()
+		if r != nil {
+			// Cleanup on panic, then re-panic
+			for i := len(started) - 1; i >= 0; i-- {
+				started[i]()
+			}
+			panic(r)
+		} else if !success {
+			// Cleanup on failure (non-panic)
+			for i := len(started) - 1; i >= 0; i-- {
+				started[i]()
+			}
+		}
+	}()
+
 	// Load database
 	dbNeedsRecovery := false
 	dbConfig := &database.Config{
@@ -93,6 +116,7 @@ func (n *Node) Run(ctx context.Context) error {
 		return errors.New("empty database returned")
 	}
 	n.db = db
+	started = append(started, func() { n.db.Close() })
 	if err != nil {
 		var dbErr database.CommitTimestampError
 		if !errors.As(err, &dbErr) {
@@ -138,6 +162,13 @@ func (n *Node) Run(ctx context.Context) error {
 			ValidateHistorical:         n.config.validateHistorical,
 			BlockfetchRequestRangeFunc: n.ouroboros.BlockfetchClientRequestRange,
 			DatabaseWorkerPoolConfig:   n.config.DatabaseWorkerPoolConfig,
+			GetActiveConnectionFunc: func() *ouroboros.ConnectionId {
+				// Return the active chainsync client connection from chainsync state
+				if n.chainsyncState != nil {
+					return n.chainsyncState.GetClientConnId()
+				}
+				return nil
+			},
 			FatalErrorFunc: func(err error) {
 				n.config.logger.Error(
 					"fatal ledger error, initiating shutdown",
@@ -163,6 +194,7 @@ func (n *Node) Run(ctx context.Context) error {
 	if err := n.ledgerState.Start(n.ctx); err != nil { //nolint:contextcheck
 		return fmt.Errorf("failed to start ledger: %w", err)
 	}
+	started = append(started, func() { n.ledgerState.Close() })
 	// Initialize mempool
 	n.mempool = mempool.NewMempool(mempool.MempoolConfig{
 		MempoolCapacity: n.config.mempoolCapacity,
@@ -181,6 +213,69 @@ func (n *Node) Run(ctx context.Context) error {
 		n.ledgerState,
 	)
 	n.ouroboros.ChainsyncState = n.chainsyncState
+	// Initialize chain selector for multi-peer chain selection
+	n.chainSelector = chainselection.NewChainSelector(
+		chainselection.ChainSelectorConfig{
+			Logger:   n.config.logger,
+			EventBus: n.eventBus,
+		},
+	)
+	// Subscribe chain selector to peer tip update events
+	n.eventBus.SubscribeFunc(
+		chainselection.PeerTipUpdateEventType,
+		n.chainSelector.HandlePeerTipUpdateEvent,
+	)
+	// Subscribe to chain switch events to update active connection
+	n.eventBus.SubscribeFunc(
+		chainselection.ChainSwitchEventType,
+		func(evt event.Event) {
+			e, ok := evt.Data.(chainselection.ChainSwitchEvent)
+			if !ok {
+				return
+			}
+			n.config.logger.Info(
+				"chain switch: updating active connection",
+				"previous_connection", e.PreviousConnectionId.String(),
+				"new_connection", e.NewConnectionId.String(),
+				"new_tip_block", e.NewTip.BlockNumber,
+				"new_tip_slot", e.NewTip.Point.Slot,
+			)
+			n.chainsyncState.SetClientConnId(e.NewConnectionId)
+		},
+	)
+	// Subscribe to chain fork events for monitoring
+	n.eventBus.SubscribeFunc(
+		chain.ChainForkEventType,
+		func(evt event.Event) {
+			e, ok := evt.Data.(chain.ChainForkEvent)
+			if !ok {
+				return
+			}
+			n.config.logger.Warn(
+				"chain fork detected",
+				"fork_point_slot", e.ForkPoint.Slot,
+				"fork_depth", e.ForkDepth,
+				"alternate_head_slot", e.AlternateHead.Slot,
+				"canonical_head_slot", e.CanonicalHead.Slot,
+			)
+		},
+	)
+	// Subscribe to connection closed events to remove peers from chain selector
+	n.eventBus.SubscribeFunc(
+		connmanager.ConnectionClosedEventType,
+		func(evt event.Event) {
+			e, ok := evt.Data.(connmanager.ConnectionClosedEvent)
+			if !ok {
+				return
+			}
+			n.chainSelector.RemovePeer(e.ConnectionId)
+		},
+	)
+	// Start the chain selector
+	if err := n.chainSelector.Start(n.ctx); err != nil { //nolint:contextcheck
+		return fmt.Errorf("failed to start chain selector: %w", err)
+	}
+	started = append(started, func() { n.chainSelector.Stop() })
 	// Configure connection manager
 	tmpListeners := n.ouroboros.ConfigureListeners(n.config.listeners)
 	n.connManager = connmanager.NewConnectionManager(
@@ -203,6 +298,11 @@ func (n *Node) Run(ctx context.Context) error {
 	if err := n.connManager.Start(n.ctx); err != nil { //nolint:contextcheck
 		return err
 	}
+	started = append(started, func() { //nolint:contextcheck
+		if err := n.connManager.Stop(context.Background()); err != nil {
+			n.config.logger.Error("failed to stop connection manager during cleanup", "error", err)
+		}
+	})
 	// Configure peer governor
 	// Create ledger peer provider for discovering peers from stake pool relays
 	ledgerPeerProvider, err := ledger.NewLedgerPeerProvider(n.ledgerState, n.db)
@@ -218,17 +318,20 @@ func (n *Node) Run(ctx context.Context) error {
 
 	n.peerGov = peergov.NewPeerGovernor(
 		peergov.PeerGovernorConfig{
-			Logger:             n.config.logger,
-			EventBus:           n.eventBus,
-			ConnManager:        n.connManager,
-			DisableOutbound:    n.config.isDevMode(),
-			PromRegistry:       n.config.promRegistry,
-			PeerRequestFunc:    n.ouroboros.RequestPeersFromPeer,
-			LedgerPeerProvider: ledgerPeerProvider,
-			UseLedgerAfterSlot: useLedgerAfterSlot,
-			MaxColdPeers:       n.config.maxColdPeers,
-			MaxWarmPeers:       n.config.maxWarmPeers,
-			MaxHotPeers:        n.config.maxHotPeers,
+			Logger:                         n.config.logger,
+			EventBus:                       n.eventBus,
+			ConnManager:                    n.connManager,
+			DisableOutbound:                n.config.isDevMode(),
+			PromRegistry:                   n.config.promRegistry,
+			PeerRequestFunc:                n.ouroboros.RequestPeersFromPeer,
+			LedgerPeerProvider:             ledgerPeerProvider,
+			UseLedgerAfterSlot:             useLedgerAfterSlot,
+			TargetNumberOfKnownPeers:       n.config.targetNumberOfKnownPeers,
+			TargetNumberOfEstablishedPeers: n.config.targetNumberOfEstablishedPeers,
+			TargetNumberOfActivePeers:      n.config.targetNumberOfActivePeers,
+			ActivePeersTopologyQuota:       n.config.activePeersTopologyQuota,
+			ActivePeersGossipQuota:         n.config.activePeersGossipQuota,
+			ActivePeersLedgerQuota:         n.config.activePeersLedgerQuota,
 		},
 	)
 	n.ouroboros.PeerGov = n.peerGov
@@ -242,6 +345,7 @@ func (n *Node) Run(ctx context.Context) error {
 	if err := n.peerGov.Start(n.ctx); err != nil { //nolint:contextcheck
 		return err
 	}
+	started = append(started, func() { n.peerGov.Stop() })
 	// Configure UTxO RPC
 	n.utxorpc = utxorpc.NewUtxorpc(
 		utxorpc.UtxorpcConfig{
@@ -255,6 +359,14 @@ func (n *Node) Run(ctx context.Context) error {
 	if err := n.utxorpc.Start(n.ctx); err != nil { //nolint:contextcheck
 		return err
 	}
+	started = append(started, func() { //nolint:contextcheck
+		if err := n.utxorpc.Stop(context.Background()); err != nil {
+			n.config.logger.Error("failed to stop utxorpc during cleanup", "error", err)
+		}
+	})
+
+	// All components started successfully
+	success = true
 
 	// Wait for shutdown signal
 	<-n.ctx.Done()
@@ -287,6 +399,10 @@ func (n *Node) shutdown() error {
 
 	// Phase 1: Stop accepting new work
 	n.config.logger.Debug("shutdown phase 1: stopping new work")
+
+	if n.chainSelector != nil {
+		n.chainSelector.Stop()
+	}
 
 	if n.peerGov != nil {
 		n.peerGov.Stop()
@@ -324,6 +440,15 @@ func (n *Node) shutdown() error {
 			err = errors.Join(
 				err,
 				fmt.Errorf("ledger state close: %w", closeErr),
+			)
+		}
+	}
+
+	if n.db != nil {
+		if closeErr := n.db.Close(); closeErr != nil {
+			err = errors.Join(
+				err,
+				fmt.Errorf("database close: %w", closeErr),
 			)
 		}
 	}

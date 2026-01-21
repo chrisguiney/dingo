@@ -1,4 +1,4 @@
-// Copyright 2025 Blink Labs Software
+// Copyright 2026 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -196,14 +196,63 @@ func (ls *LedgerState) SubmitAsyncDBOperation(
 
 // SubmitAsyncDBTxn submits a database transaction operation for execution on the worker pool.
 // This method blocks waiting for the result and must be called after Start() and before Close().
+// If a partial commit occurs (blob committed but metadata failed), this method will attempt
+// to trigger database recovery to restore consistency.
 func (ls *LedgerState) SubmitAsyncDBTxn(
 	opFunc func(txn *database.Txn) error,
 	readWrite bool,
 ) error {
-	return ls.SubmitAsyncDBOperation(func(db *database.Database) error {
+	err := ls.SubmitAsyncDBOperation(func(db *database.Database) error {
 		txn := db.Transaction(readWrite)
 		return txn.Do(opFunc)
 	})
+	// Check for partial commit and trigger recovery if needed.
+	// Guard against recursive recovery: if we're already in recovery and another
+	// PartialCommitError occurs, don't attempt recovery again to prevent unbounded recursion.
+	var partialCommitErr database.PartialCommitError
+	if err != nil && errors.As(err, &partialCommitErr) {
+		ls.Lock()
+		alreadyInRecovery := ls.inRecovery
+		if !alreadyInRecovery {
+			ls.inRecovery = true
+		}
+		ls.Unlock()
+
+		if alreadyInRecovery {
+			ls.config.Logger.Error(
+				"partial commit detected during recovery, skipping nested recovery: " + err.Error(),
+			)
+			return err
+		}
+
+		defer func() {
+			ls.Lock()
+			ls.inRecovery = false
+			ls.Unlock()
+		}()
+
+		ls.config.Logger.Error(
+			"partial commit detected, attempting recovery: " + err.Error(),
+		)
+		// Attempt to recover from the partial commit state
+		if recoveryErr := ls.RecoverCommitTimestampConflict(); recoveryErr != nil {
+			ls.config.Logger.Error(
+				"failed to recover from partial commit: " + recoveryErr.Error(),
+			)
+			// Return both errors joined to preserve error chain for errors.Is checks
+			return errors.Join(err, recoveryErr)
+		}
+		ls.config.Logger.Info("successfully recovered from partial commit")
+		// Return an error so callers know the operation failed and should retry.
+		// Recovery restored consistency but did NOT complete the original transaction.
+		// Wrap the underlying metadata error (not PartialCommitError) so callers
+		// won't match errors.Is(err, types.ErrPartialCommit) and attempt recovery again.
+		return fmt.Errorf(
+			"transaction failed, recovered from partial commit: %w",
+			partialCommitErr.MetadataErr,
+		)
+	}
+	return err
 }
 
 // SubmitAsyncDBReadTxn submits a read-only database transaction operation for execution on the worker pool.
@@ -264,6 +313,10 @@ const (
 // the node to shut down. The callback should trigger graceful shutdown.
 type FatalErrorFunc func(err error)
 
+// GetActiveConnectionFunc is a callback to retrieve the currently active
+// chainsync connection ID for chain selection purposes.
+type GetActiveConnectionFunc func() *ouroboros.ConnectionId
+
 type LedgerStateConfig struct {
 	PromRegistry               prometheus.Registerer
 	Logger                     *slog.Logger
@@ -272,6 +325,7 @@ type LedgerStateConfig struct {
 	EventBus                   *event.EventBus
 	CardanoNodeConfig          *cardano.CardanoNodeConfig
 	BlockfetchRequestRangeFunc BlockfetchRequestRangeFunc
+	GetActiveConnectionFunc    GetActiveConnectionFunc
 	FatalErrorFunc             FatalErrorFunc
 	ValidateHistorical         bool
 	ForgeBlocks                bool
@@ -315,6 +369,7 @@ type LedgerState struct {
 	chainsyncBlockfetchWaiting bool
 	checkpointWrittenForEpoch  bool
 	closed                     bool
+	inRecovery                 bool // guards against recursive recovery in SubmitAsyncDBTxn
 }
 
 func NewLedgerState(cfg LedgerStateConfig) (*LedgerState, error) {
@@ -527,20 +582,23 @@ func (ls *LedgerState) scheduleCleanupConsumedUtxos() {
 }
 
 func (ls *LedgerState) cleanupConsumedUtxos() {
-	// Get the current tip, since we're querying by slot
+	// Get the current tip slot while holding the read lock to avoid TOCTOU race.
+	// We capture only the slot value we need, so even if currentTip changes after
+	// we release the lock, we're working with a consistent snapshot of the slot.
 	ls.RLock()
-	tip := ls.currentTip
+	tipSlot := ls.currentTip.Point.Slot
 	ls.RUnlock()
+
 	// Delete UTxOs that are marked as deleted and older than our slot window
 	ls.config.Logger.Debug(
 		"cleaning up consumed UTxOs",
 		"component", "ledger",
 	)
-	if tip.Point.Slot > cleanupConsumedUtxosSlotWindow {
+	if tipSlot > cleanupConsumedUtxosSlotWindow {
 		for {
 			ls.Lock()
 			count, err := ls.db.UtxosDeleteConsumed(
-				tip.Point.Slot-cleanupConsumedUtxosSlotWindow,
+				tipSlot-cleanupConsumedUtxosSlotWindow,
 				10000,
 				nil,
 			)
@@ -1187,7 +1245,9 @@ func (ls *LedgerState) ledgerProcessBlock(
 								)
 							}
 							// Filter placeholders (0xF4 false, 0xF5 true, 0xF6 null)
-							if len(txArray[2]) > 0 && txArray[2][0] != 0xF4 && txArray[2][0] != 0xF5 && txArray[2][0] != 0xF6 {
+							if len(txArray[2]) > 0 && txArray[2][0] != 0xF4 &&
+								txArray[2][0] != 0xF5 &&
+								txArray[2][0] != 0xF6 {
 								auxCborHex = hex.EncodeToString(
 									[]byte(txArray[2]),
 								)
