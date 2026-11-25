@@ -64,6 +64,27 @@ type NewEpochPool struct {
 
 const rewardBlockBatch = 500
 
+// NewEpochPParamUpdate is a classic update-system proposal: a genesis key's
+// update, the slot it was added at and the epoch it targets.
+type NewEpochPParamUpdate struct {
+	GenesisHash []byte
+	Cbor        []byte
+	AddedSlot   uint64
+	Epoch       uint64
+}
+
+// NewEpochMIR is a move-instantaneous-rewards certificate the ended epoch
+// carried: a credit of Amount to the credential from the reserves, or from the
+// treasury when FromTreasury is set; or, when OtherPot is non-zero, a transfer
+// of that much from the pot to the other.
+type NewEpochMIR struct {
+	FromTreasury bool
+	Tag          uint8
+	Key          []byte
+	Amount       int64
+	OtherPot     uint64
+}
+
 // NewEpochRewards is a reward update pending at the boundary: the rows the
 // delayed reward round reads. StakeInputs are the snapshot in force as GO,
 // PoolInputs and Snapshot describe it, BlockCounts are the blocks each pool
@@ -81,6 +102,8 @@ type NewEpochRewards struct {
 // NewEpochInput is the ledger at the end of epoch Epoch. The boundary enters
 // Epoch+1. PriorMark, PriorSet and PriorGo are the snapshots in force.
 type NewEpochInput struct {
+	// Era is the era the boundary leaves, Conway when nil.
+	Era                          *eras.EraDesc
 	Epoch                        uint64
 	PParams                      lcommon.ProtocolParameters
 	Reserves, Treasury           uint64
@@ -92,6 +115,12 @@ type NewEpochInput struct {
 	// Rewards is the pending reward update, nil when there is none. When set
 	// its stake rows replace PriorGo.
 	Rewards *NewEpochRewards
+	// PParamUpdates are the classic update proposals, adopted when UpdateQuorum
+	// genesis keys agree. UpdateQuorum is 5 when zero.
+	PParamUpdates []NewEpochPParamUpdate
+	UpdateQuorum  int
+	// MIRs are the certificates of the ended epoch, in order.
+	MIRs []NewEpochMIR
 	// Gov is the governance state the boundary reads, nil for none. It is
 	// the state RATIFY decided over at the boundary before: that decision is
 	// made by the production RATIFY on a database of its own, and the
@@ -106,6 +135,9 @@ type NewEpochOutput struct {
 	PoolsRemoved       [][]byte
 	Reserves, Treasury uint64
 	Mark, Set, Go      []SnapshotStake
+	// PParams are the protocol parameters the new epoch runs under: the
+	// input's with any enacted ParameterChange and HardForkInitiation applied.
+	PParams lcommon.ProtocolParameters
 	// Gov is set when the input held governance state.
 	Gov *NewEpochGovOutput
 }
@@ -125,25 +157,33 @@ func NewEpoch(ctx context.Context, in NewEpochInput) (out NewEpochOutput, err er
 	db, set := store.db, store.set
 
 	nodeCfg := &cardano.CardanoNodeConfig{ShelleyGenesisHash: strings.Repeat("5a", 32)}
-	if err := scratchShelleyGenesis(nodeCfg, strings.NewReader(`{
+	quorum := in.UpdateQuorum
+	if quorum == 0 {
+		quorum = 5
+	}
+	if err := scratchShelleyGenesis(nodeCfg, strings.NewReader(fmt.Sprintf(`{
 		"activeSlotsCoeff": 0.05,
 		"epochLength": 432000,
 		"maxLovelaceSupply": 45000000000000000,
 		"securityParam": 2160,
 		"slotLength": 1,
-		"updateQuorum": 5,
+		"updateQuorum": %d,
 		"systemStart": "2017-09-23T21:44:51Z"
-	}`)); err != nil {
+	}`, quorum))); err != nil {
 		return out, fmt.Errorf("dxoracle: genesis: %w", err)
+	}
+	era := eras.ConwayEraDesc
+	if in.Era != nil {
+		era = *in.Era
 	}
 	epoch := models.Epoch{
 		EpochId: in.Epoch, StartSlot: in.Epoch * snapshotEpochLength,
 		SlotLength: 1000, LengthInSlots: snapshotEpochLength,
-		EraId: eras.ConwayEraDesc.Id,
+		EraId: era.Id,
 	}
 	sl, err := ledger.NewScratchLedger(ledger.ScratchLedgerConfig{
 		Database: db, UtxoSet: set, NodeConfig: nodeCfg,
-		Era: eras.ConwayEraDesc, Epoch: epoch, PParams: in.PParams,
+		Era: era, Epoch: epoch, PParams: in.PParams,
 		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	})
 	if err != nil {
@@ -195,6 +235,7 @@ func NewEpoch(ctx context.Context, in NewEpochInput) (out NewEpochOutput, err er
 		return out, fmt.Errorf("dxoracle: rollover: %w", err)
 	}
 	out.Epoch = result.NewCurrentEpoch.EpochId
+	out.PParams = result.NewCurrentPParams
 	out, err = readNewEpoch(ctx, ls, in, before, out)
 	if err != nil || in.Gov == nil {
 		return out, err
@@ -267,7 +308,7 @@ func seedNewEpoch(
 		if i == 2 && in.Rewards != nil {
 			for _, r := range in.Rewards.StakeInputs {
 				row := *r
-				row.Epoch, row.BoundarySlot = ep, ep*snapshotEpochLength
+				row.Epoch, row.BoundarySlot, row.CapturedSlot = ep, ep*snapshotEpochLength, ep*snapshotEpochLength
 				rows = append(rows, &row)
 			}
 			prior = nil
@@ -292,6 +333,25 @@ func seedNewEpoch(
 	}
 	if in.Gov != nil {
 		govChanges(&changes, *in.Gov, prior)
+	}
+	for i, u := range in.PParamUpdates {
+		changes.PParamUpdates = append(changes.PParamUpdates, ledger.PParamUpdateChange{
+			Index: uint32(i), //nolint:gosec // test-sized index
+			Update: models.PParamUpdate{
+				GenesisHash: u.GenesisHash, Cbor: u.Cbor, AddedSlot: u.AddedSlot, Epoch: u.Epoch,
+			},
+		})
+	}
+	for i, m := range in.MIRs {
+		cert := ledger.MIRCert{Slot: epoch.StartSlot + 1, Position: uint64(i), OtherPot: m.OtherPot} //nolint:gosec // test-sized index
+		cert.Pot = epochengine.MIRPotReserves
+		if m.FromTreasury {
+			cert.Pot = epochengine.MIRPotTreasury
+		}
+		if m.OtherPot == 0 {
+			cert.Rewards = []models.MIRReward{{Credential: m.Key, CredentialTag: m.Tag, Amount: big.NewInt(m.Amount)}}
+		}
+		changes.MIRCerts = append(changes.MIRCerts, cert)
 	}
 	sl.SeedChanges(changes)
 	for i, s := range in.Stake {

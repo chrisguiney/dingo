@@ -23,9 +23,14 @@ import (
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/database/types"
 	"github.com/blinklabs-io/dingo/dxoracle"
+	"github.com/blinklabs-io/dingo/ledger/eras"
 	"github.com/blinklabs-io/dingo/ledger/governance"
 	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger/alonzo"
+	"github.com/blinklabs-io/gouroboros/ledger/babbage"
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/blinklabs-io/gouroboros/ledger/conway"
+	"github.com/blinklabs-io/gouroboros/ledger/shelley"
 	"github.com/stretchr/testify/require"
 )
 
@@ -243,4 +248,215 @@ func TestNewEpochGovUnratifiedWithdrawalStays(t *testing.T) {
 	require.Empty(t, got.Gov.Removed)
 	require.Equal(t, uint64(5_000_000), got.Treasury)
 	require.Equal(t, uint64(7), got.Accounts[0].Reward)
+}
+
+// A ParameterChange the boundary before accepted is enacted at the boundary:
+// max_block_body_size (key 2) goes from 65_536 to 0x16000 = 90_112 and the
+// result holds every other parameter as it was. The change is in the
+// security group, so the DRep, committee and pool votes are all needed.
+func TestNewEpochEnactsParameterChange(t *testing.T) {
+	t.Parallel()
+	pp := conwayPParams()
+	pp.MaxBlockBodySize = 65_536
+	pp.MinCommitteeSize = 1
+	gov := dxoracle.GovState{
+		PParams:   pp,
+		Treasury:  5_000_000,
+		Accounts:  []dxoracle.Account{{Tag: 0, Key: key(1), Active: true}},
+		Dreps:     []dxoracle.DRep{{Tag: 0, Key: key(0xd1), ExpiryEpoch: 30, Active: true}},
+		DRepStake: []dxoracle.GovDRepStake{{Delegation: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}, Stake: 100}},
+		Committee: []dxoracle.CommitteeMember{{Tag: 0, Key: key(0xc1), Expiry: 40, Hot: &dxoracle.Credential{Tag: 0, Key: key(0xc2)}}},
+		Quorum:    big.NewRat(1, 1),
+		SPO:       &governance.SPOVotingState{Dist: []*models.PoolStakeSnapshot{{PoolKeyHash: key(0xa0), TotalStake: 100}}, TotalStake: 100},
+		Proposals: []dxoracle.GovProposal{proposal(1, pcAction(0), 0, nil, 15, 0, 0xa2)},
+		Votes: []dxoracle.GovVote{
+			{Proposal: 0, Role: 1, Tag: 0, Key: key(0xd1), Vote: 1},
+			{Proposal: 0, Role: 0, Tag: 0, Key: key(0xc2), Vote: 1},
+			{Proposal: 0, Role: 2, Key: key(0xa0), Vote: 1},
+		},
+	}
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: pp, Reserves: 10_000_000_000, Treasury: 5_000_000,
+		Accounts: []dxoracle.NewEpochAccount{{Key: key(1)}},
+		Gov:      &gov,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []dxoracle.GovAction{action(1)}, got.Gov.Enacted)
+	after, ok := got.PParams.(*conway.ConwayProtocolParameters)
+	require.True(t, ok, "pparams %T", got.PParams)
+	require.Equal(t, uint(90_112), after.MaxBlockBodySize)
+	want := *pp
+	want.MaxBlockBodySize = 90_112
+	require.Equal(t, want.MinFeeA, after.MinFeeA)
+	require.Equal(t, want.ProtocolVersion, after.ProtocolVersion)
+}
+
+// Without an accepted ParameterChange the parameters come back as they went in.
+func TestNewEpochKeepsParameters(t *testing.T) {
+	t.Parallel()
+	pp := conwayPParams()
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: pp, Reserves: 10_000_000_000, Treasury: 1_000_000,
+		Accounts: []dxoracle.NewEpochAccount{{Key: key(1)}},
+	})
+	require.NoError(t, err)
+	after, ok := got.PParams.(*conway.ConwayProtocolParameters)
+	require.True(t, ok, "pparams %T", got.PParams)
+	require.Equal(t, pp.MaxBlockBodySize, after.MaxBlockBodySize)
+	require.Equal(t, pp.ProtocolVersion, after.ProtocolVersion)
+}
+
+// hardForkBoundary enacts a ratified hard fork to to (major, minor) at a
+// ledger on protocol from, with account 0x72 delegating to a DRep nobody
+// registered and 0x71 to the registered DRep.
+func hardForkBoundary(t *testing.T, from uint, hf string) dxoracle.NewEpochOutput {
+	t.Helper()
+	pp := conwayPParams()
+	pp.ProtocolVersion.Major = from
+	pp.MinCommitteeSize = 1
+	gov := dxoracle.GovState{
+		PParams:   pp,
+		Treasury:  5_000_000,
+		Accounts:  []dxoracle.Account{{Tag: 0, Key: key(1), Active: true}},
+		Dreps:     []dxoracle.DRep{{Tag: 0, Key: key(0xd1), ExpiryEpoch: 30, Active: true}},
+		DRepStake: []dxoracle.GovDRepStake{{Delegation: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}, Stake: 100}},
+		Committee: []dxoracle.CommitteeMember{{Tag: 0, Key: key(0xc1), Expiry: 40, Hot: &dxoracle.Credential{Tag: 0, Key: key(0xc2)}}},
+		Quorum:    big.NewRat(1, 1),
+		SPO:       &governance.SPOVotingState{Dist: []*models.PoolStakeSnapshot{{PoolKeyHash: key(0xa0), TotalStake: 100}}, TotalStake: 100},
+		Proposals: []dxoracle.GovProposal{proposal(1, mustHex(hf), 1, nil, 15, 0, 0xa2)},
+		Votes: []dxoracle.GovVote{
+			{Proposal: 0, Role: 1, Tag: 0, Key: key(0xd1), Vote: 1},
+			{Proposal: 0, Role: 0, Tag: 0, Key: key(0xc2), Vote: 1},
+			{Proposal: 0, Role: 2, Key: key(0xa0), Vote: 1},
+		},
+	}
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: pp, Reserves: 10_000_000_000, Treasury: 5_000_000,
+		Accounts: []dxoracle.NewEpochAccount{
+			{Key: key(1)},
+			{Key: key(0x71), Drep: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}},
+			{Key: key(0x72), Drep: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xdd)}},
+		},
+		Gov: &gov,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []dxoracle.GovAction{action(1)}, got.Gov.Enacted)
+	return got
+}
+
+// Enacting a hard fork to 10 runs the protocol 10 HARDFORK step: the version
+// changes and the delegation to the unregistered DRep is cleared while the
+// delegation to the registered DRep stays.
+func TestNewEpochHardForkTo10ClearsDanglingDelegation(t *testing.T) {
+	t.Parallel()
+	got := hardForkBoundary(t, 9, "8301f6820a00")
+	after := got.PParams.(*conway.ConwayProtocolParameters)
+	require.Equal(t, uint(10), after.ProtocolVersion.Major)
+	require.Equal(t, uint(0), after.ProtocolVersion.Minor)
+	require.Equal(t, dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}, got.Accounts[1].Drep)
+	require.Equal(t, dxoracle.Delegation{}, got.Accounts[2].Drep)
+}
+
+// A hard fork from 10 to 11 changes only the version: the protocol 11 step
+// has no effect on delegations.
+func TestNewEpochHardForkTo11KeepsDelegations(t *testing.T) {
+	t.Parallel()
+	got := hardForkBoundary(t, 10, "8301f6820b00")
+	after := got.PParams.(*conway.ConwayProtocolParameters)
+	require.Equal(t, uint(11), after.ProtocolVersion.Major)
+	require.Equal(t, dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xdd)}, got.Accounts[2].Drep)
+}
+
+// A pre-Conway boundary runs the same pool retirement, refund and snapshot
+// rotation as Conway's: no governance state exists. Shelley, Allegra and Mary
+// share the Shelley parameters; Alonzo's and Babbage's carry their own.
+func TestNewEpochPreConwayPoolRetirement(t *testing.T) {
+	t.Parallel()
+	shelleyPP := func(major uint) lcommon.ProtocolParameters {
+		pp := &shelley.ShelleyProtocolParameters{}
+		pp.ProtocolMajor = major
+		return pp
+	}
+	alonzoPP := &alonzo.AlonzoProtocolParameters{}
+	alonzoPP.ProtocolMajor = 5
+	babbagePP := &babbage.BabbageProtocolParameters{}
+	babbagePP.ProtocolMajor = 8
+	for name, tc := range map[string]struct {
+		era eras.EraDesc
+		pp  lcommon.ProtocolParameters
+	}{
+		"shelley": {eras.ShelleyEraDesc, shelleyPP(2)},
+		"allegra": {eras.AllegraEraDesc, shelleyPP(3)},
+		"mary":    {eras.MaryEraDesc, shelleyPP(4)},
+		"alonzo":  {eras.AlonzoEraDesc, alonzoPP},
+		"babbage": {eras.BabbageEraDesc, babbagePP},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			retire := uint64(11)
+			era := tc.era
+			got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+				Era: &era, Epoch: 10, PParams: tc.pp, Reserves: 10_000_000_000, Treasury: 1_000_000,
+				Accounts: []dxoracle.NewEpochAccount{
+					{Key: key(1)},
+					{Key: key(2), Reward: 5, Pool: key(0xa0)},
+				},
+				Pools: []dxoracle.NewEpochPool{{
+					Key: key(0xa0), Deposit: 500, RewardKey: key(1), RetiringEpoch: &retire,
+				}},
+				Stake:     []dxoracle.SnapshotStake{{Key: key(2), Amount: 40}},
+				PriorMark: []dxoracle.SnapshotStake{snapRow(3, 100, 0xa0)},
+			})
+			require.NoError(t, err)
+			require.Equal(t, [][]byte{key(0xa0)}, got.PoolsRemoved)
+			require.Equal(t, uint64(500), got.Accounts[0].Reward)
+			require.Empty(t, got.Accounts[1].Pool)
+			require.Equal(t, []dxoracle.SnapshotStake{snapRow(2, 45, 0xa0)}, got.Mark)
+			require.Equal(t, []dxoracle.SnapshotStake{snapRow(3, 100, 0xa0)}, got.Set)
+		})
+	}
+}
+
+func preConwayBoundary(in dxoracle.NewEpochInput) dxoracle.NewEpochInput {
+	era := eras.BabbageEraDesc
+	pp := &babbage.BabbageProtocolParameters{}
+	pp.ProtocolMajor = 8
+	pp.MinFeeA, pp.MaxBlockBodySize, pp.MaxTxSize, pp.MaxBlockHeaderSize = 44, 65_536, 16_384, 1_100
+	in.Era, in.PParams, in.Epoch = &era, pp, 10
+	in.Reserves, in.Treasury = 10_000_000_000, 1_000_000
+	return in
+}
+
+// Two of the three required genesis keys vote the same update for the
+// ended epoch, so it is adopted at the boundary: min_fee_a (key 0) goes from
+// 44 to 100. A quorum of 3 would not be met.
+func TestNewEpochAdoptsParameterUpdate(t *testing.T) {
+	t.Parallel()
+	update := []byte{0xa1, 0x00, 0x18, 0x64}
+	prop := func(k byte) dxoracle.NewEpochPParamUpdate {
+		return dxoracle.NewEpochPParamUpdate{GenesisHash: key(k), Cbor: update, AddedSlot: 10*432_000 + 10, Epoch: 10}
+	}
+	for quorum, want := range map[int]uint64{2: 100, 3: 44} {
+		got, err := dxoracle.NewEpoch(context.Background(), preConwayBoundary(dxoracle.NewEpochInput{
+			Accounts:      []dxoracle.NewEpochAccount{{Key: key(1)}},
+			UpdateQuorum:  quorum,
+			PParamUpdates: []dxoracle.NewEpochPParamUpdate{prop(1), prop(2)},
+		}))
+		require.NoError(t, err)
+		require.Equal(t, want, uint64(got.PParams.(*babbage.BabbageProtocolParameters).MinFeeA), "quorum %d", quorum)
+	}
+}
+
+// A pending MIR credit of 150 from reserves to a registered account is paid at
+// the boundary; one to an unregistered account is dropped with the rest.
+func TestNewEpochAppliesMIR(t *testing.T) {
+	t.Parallel()
+	got, err := dxoracle.NewEpoch(context.Background(), preConwayBoundary(dxoracle.NewEpochInput{
+		Accounts: []dxoracle.NewEpochAccount{{Key: key(1)}},
+		MIRs:     []dxoracle.NewEpochMIR{{Key: key(1), Amount: 150}},
+	}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), got.Accounts[0].Reward)
+	require.Equal(t, uint64(10_000_000_000-150), got.Reserves)
+	require.Equal(t, uint64(1_000_000), got.Treasury)
 }
