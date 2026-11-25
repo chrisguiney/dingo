@@ -130,10 +130,11 @@ func ShouldRatify(in RatifyInputs) RatifyDecision {
 	// enacted NoConfidence action is still absent; conversely, a committee
 	// remains present when its members have all expired.
 	committeePresent := !in.CommitteeAbsent
-	drepThreshold := getDRepThreshold(
-		actionType, in.PParams, in.ParameterChange, committeePresent,
+	drepThreshold := DRepThresholdInForce(
+		in.MajorVersion, actionType, in.PParams, in.ParameterChange,
+		committeePresent,
 	)
-	if inBootstrap || drepThreshold == nil || drepThreshold.Sign() == 0 {
+	if drepThreshold == nil || drepThreshold.Sign() == 0 {
 		decision.DRepApproved = true
 	} else {
 		ratio := in.Tally.DRepYesRatio()
@@ -156,26 +157,22 @@ func ShouldRatify(in RatifyInputs) RatifyDecision {
 	// CC approval: skipped entirely for NoConfidence and UpdateCommittee.
 	// For other actions, require the CC to be seated (!noConfidence),
 	// satisfy the minimum committee size, and meet quorum.
+	cc := CommitteeRequirement(
+		actionType, in.MajorVersion, in.CommitteeAbsent,
+		in.CommitteeNoConfidence, in.ActiveCCCount,
+		uint(in.PParams.MinCommitteeSize), in.CCQuorum,
+	)
 	switch {
-	case !needsCCApproval(actionType):
+	case !cc.Voting:
 		decision.CCApproved = true
-	case in.CommitteeNoConfidence:
+	case cc.Reason != "":
 		decision.CCApproved = false
-		decision.FailureReason = "cc in no-confidence state"
-	case in.CommitteeAbsent:
-		decision.CCApproved = false
-		decision.FailureReason = "committee absent"
-	case !inBootstrap && in.ActiveCCCount < int(in.PParams.MinCommitteeSize): //nolint:gosec
-		decision.CCApproved = false
-		decision.FailureReason = "cc below minimum committee size"
-	case in.CCQuorum == nil:
-		decision.CCApproved = false
-		decision.FailureReason = "cc quorum missing"
-	case in.CCQuorum.Sign() == 0:
+		decision.FailureReason = cc.Reason
+	case cc.Quorum.Sign() == 0:
 		decision.CCApproved = true
 	default:
 		ratio := in.Tally.CCYesRatio()
-		decision.CCApproved = ratio.Cmp(in.CCQuorum) >= 0
+		decision.CCApproved = ratio.Cmp(cc.Quorum) >= 0
 	}
 
 	decision.Ratified = decision.DRepApproved && decision.SPOApproved &&
