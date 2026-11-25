@@ -333,3 +333,64 @@ func TestPlanCommitteeUpdate(t *testing.T) {
 	assert.Equal(t, uint64(300), plan.Add[1].AddedSlot)
 	assert.Equal(t, uint64(60), plan.Add[1].ExpiresEpoch)
 }
+
+func TestDRepThresholdInForce(t *testing.T) {
+	t.Parallel()
+	pp := &conway.ConwayProtocolParameters{}
+	pp.DRepVotingThresholds.HardForkInitiation = cbor.Rat{Rat: big.NewRat(3, 5)}
+	pp.DRepVotingThresholds.MotionNoConfidence = cbor.Rat{Rat: big.NewRat(2, 3)}
+
+	// During the Conway bootstrap DReps gate nothing except through a zero
+	// threshold; Info stays unvotable.
+	got := DRepThresholdInForce(9, lcommon.GovActionTypeHardForkInitiation, pp, nil, true)
+	require.NotNil(t, got)
+	assert.Zero(t, got.Sign())
+	assert.Nil(t, DRepThresholdInForce(9, lcommon.GovActionTypeInfo, pp, nil, true))
+
+	got = DRepThresholdInForce(10, lcommon.GovActionTypeHardForkInitiation, pp, nil, true)
+	assert.Equal(t, 0, got.Cmp(big.NewRat(3, 5)))
+	assert.Nil(t, DRepThresholdInForce(10, lcommon.GovActionTypeInfo, pp, nil, true))
+}
+
+func TestCommitteeRequirement(t *testing.T) {
+	t.Parallel()
+	q := big.NewRat(2, 3)
+	pc := lcommon.GovActionTypeParameterChange
+	for name, tc := range map[string]struct {
+		action     lcommon.GovActionType
+		major      uint
+		absent     bool
+		noConf     bool
+		active     int
+		minSize    uint
+		quorum     *big.Rat
+		wantVoting bool
+		wantBlock  bool
+		wantQuorum *big.Rat
+	}{
+		"no confidence is not voted":    {action: lcommon.GovActionTypeNoConfidence, major: 10, quorum: q},
+		"update committee is not voted": {action: lcommon.GovActionTypeUpdateCommittee, major: 10, quorum: q},
+		"info is not voted":             {action: lcommon.GovActionTypeInfo, major: 10, quorum: q},
+		"quorum in force":               {action: pc, major: 10, active: 3, minSize: 3, quorum: q, wantVoting: true, wantQuorum: q},
+		"below minimum size":            {action: pc, major: 10, active: 2, minSize: 3, quorum: q, wantVoting: true, wantBlock: true},
+		"bootstrap waives minimum size": {action: pc, major: 9, active: 0, minSize: 3, quorum: q, wantVoting: true, wantQuorum: q},
+		"absent committee":              {action: pc, major: 10, absent: true, active: 3, quorum: q, wantVoting: true, wantBlock: true},
+		"bootstrap absent committee":    {action: pc, major: 9, absent: true, quorum: q, wantVoting: true, wantBlock: true},
+		"no confidence state":           {action: pc, major: 10, noConf: true, active: 3, quorum: q, wantVoting: true, wantBlock: true},
+		"missing quorum":                {action: pc, major: 10, active: 3, quorum: nil, wantVoting: true, wantBlock: true},
+		"zero quorum":                   {action: pc, major: 10, active: 3, quorum: new(big.Rat), wantVoting: true, wantQuorum: new(big.Rat)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := CommitteeRequirement(tc.action, tc.major, tc.absent, tc.noConf, tc.active, tc.minSize, tc.quorum)
+			assert.Equal(t, tc.wantVoting, got.Voting)
+			assert.Equal(t, tc.wantBlock, got.Reason != "")
+			if tc.wantQuorum != nil {
+				require.NotNil(t, got.Quorum)
+				assert.Equal(t, 0, got.Quorum.Cmp(tc.wantQuorum))
+			} else {
+				assert.Nil(t, got.Quorum)
+			}
+		})
+	}
+}

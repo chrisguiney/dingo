@@ -315,6 +315,66 @@ func RequiresCCApproval(actionType lcommon.GovActionType) bool {
 	return needsCCApproval(actionType)
 }
 
+// DRepThresholdInForce is DRepThreshold under protocol major version
+// majorVersion. During the Conway bootstrap phase every DRep threshold except
+// Info's is zero, so DReps cannot block an action; Info stays unvotable (nil).
+func DRepThresholdInForce(
+	majorVersion uint,
+	actionType lcommon.GovActionType,
+	pparams *conway.ConwayProtocolParameters,
+	parameterChange lcommon.ParameterChangeGovAction,
+	committeePresent bool,
+) *big.Rat {
+	if majorVersion == bootstrapProtocolVersion &&
+		actionType != lcommon.GovActionTypeInfo {
+		return new(big.Rat)
+	}
+	return getDRepThreshold(
+		actionType, pparams, parameterChange, committeePresent,
+	)
+}
+
+// CommitteeApproval is what the constitutional committee must satisfy for an
+// action.
+type CommitteeApproval struct {
+	// Voting is false when the committee does not vote on the action.
+	Voting bool
+	// Reason is non-empty when the committee cannot approve the action.
+	Reason string
+	// Quorum is the yes ratio the committee must reach. It is set only when
+	// Voting is true and Reason is empty.
+	Quorum *big.Rat
+}
+
+// CommitteeRequirement evaluates the committee gate of an action: who must
+// approve and at what ratio. committeeAbsent and noConfidence describe the
+// enacted committee, activeMembers counts seated, unexpired, unresigned,
+// authorized members, and minSize applies outside the Conway bootstrap phase.
+func CommitteeRequirement(
+	actionType lcommon.GovActionType,
+	majorVersion uint,
+	committeeAbsent bool,
+	noConfidence bool,
+	activeMembers int,
+	minSize uint,
+	quorum *big.Rat,
+) CommitteeApproval {
+	inBootstrap := majorVersion == bootstrapProtocolVersion
+	switch {
+	case !needsCCApproval(actionType):
+		return CommitteeApproval{}
+	case noConfidence:
+		return CommitteeApproval{Voting: true, Reason: "cc in no-confidence state"}
+	case committeeAbsent:
+		return CommitteeApproval{Voting: true, Reason: "committee absent"}
+	case !inBootstrap && activeMembers < int(minSize): //nolint:gosec
+		return CommitteeApproval{Voting: true, Reason: "cc below minimum committee size"}
+	case quorum == nil:
+		return CommitteeApproval{Voting: true, Reason: "cc quorum missing"}
+	}
+	return CommitteeApproval{Voting: true, Quorum: quorum}
+}
+
 // SelectCommitteeQuorum returns the committee quorum in force: enacted when
 // non-nil, else the Conway genesis threshold, else the 2/3 default. usedDefault
 // is true only for the last case. The result may alias enacted or genesis, so
