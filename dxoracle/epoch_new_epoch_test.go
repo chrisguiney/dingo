@@ -19,6 +19,8 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/blinklabs-io/dingo/database/models"
+	"github.com/blinklabs-io/dingo/database/types"
 	"github.com/blinklabs-io/dingo/dxoracle"
 	"github.com/blinklabs-io/gouroboros/cbor"
 	"github.com/blinklabs-io/gouroboros/ledger/conway"
@@ -85,4 +87,77 @@ func TestNewEpochPoolRetirement(t *testing.T) {
 	require.Equal(t, []dxoracle.SnapshotStake{snapRow(2, 45, 0xa0)}, got.Mark)
 	require.Equal(t, []dxoracle.SnapshotStake{snapRow(3, 100, 0xa0)}, got.Set)
 	t.Logf("reserves=%d treasury=%d", got.Reserves, got.Treasury)
+}
+
+// A pending reward round pays the pool and its delegator at the boundary.
+// With rho = 3/1000, tau = 1/5, no fees and eta = 1 (21600 blocks, the
+// expected count for f = 1/20 over 432000 slots), reserves of 10^12 give
+// deltaR1 = 3_000_000_000 and a treasury cut of 600_000_000, leaving a pool
+// pot of 2_400_000_000. The pool holds all active stake, sigma = 1/1000 of
+// the 4.4999e16 circulation, so maxPool = floor(2.4e9 / 1.3 * 0.001) =
+// 1_846_153 and the pool reward is that at performance 1. With margin 1/100
+// and no owners the leader gets floor(1_846_153 / 100) = 18_461 and the
+// member floor(1_846_153 * 99 / 100) = 1_827_691; the 1 left over returns
+// to reserves with the rest of the pool pot.
+func TestNewEpochRewardApplication(t *testing.T) {
+	t.Parallel()
+	const stake = 44_999_000_000_000
+	blocks := uint64(21600)
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: conwayPParams(), Reserves: 1_000_000_000_000, Treasury: 1_000_000,
+		Accounts: []dxoracle.NewEpochAccount{
+			{Key: key(1)},
+			{Key: key(2), Pool: key(0xa0)},
+		},
+		Pools: []dxoracle.NewEpochPool{{Key: key(0xa0), RewardKey: key(1)}},
+		Rewards: &dxoracle.NewEpochRewards{
+			Snapshot: &models.RewardSnapshot{
+				TotalActiveStake: stake, ExcludedActiveStake: new(types.Uint64),
+				TotalPoolCount: 1, TotalDelegators: 1,
+			},
+			PoolInputs: []*models.RewardPoolInput{{
+				PoolKeyHash: key(0xa0), RewardAccount: key(1),
+				Margin:         &types.Rat{Rat: big.NewRat(1, 100)},
+				DelegatedStake: stake, DelegatorCount: 1,
+				BlocksProduced: &blocks, TotalBlocksInEpoch: &blocks,
+			}},
+			StakeInputs: []*models.RewardStakeInput{{
+				PoolKeyHash: key(0xa0), StakingKey: key(2), Stake: stake, Registered: true,
+			}},
+			BlockCounts: map[string]uint64{string(key(0xa0)): blocks},
+		},
+		PriorGo: []dxoracle.SnapshotStake{snapRow(2, stake, 0xa0)},
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(18_461), got.Accounts[0].Reward)
+	require.Equal(t, uint64(1_827_691), got.Accounts[1].Reward)
+	require.Equal(t, uint64(999_398_153_848), got.Reserves)
+	require.Equal(t, uint64(601_000_000), got.Treasury)
+}
+
+// A boundary leaves a DRep delegation as it found it, whether to a DRep or to
+// a predefined option, and a reward credit does not touch it.
+func TestNewEpochKeepsDRepDelegation(t *testing.T) {
+	t.Parallel()
+	retire := uint64(11)
+	delegations := []dxoracle.Delegation{
+		{Type: dxoracle.DelegateAlwaysAbstain},
+		{Type: dxoracle.DelegateAlwaysNoConfidence},
+		{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)},
+		{Type: dxoracle.DelegateScriptHash, Key: key(0xd2)},
+		{},
+	}
+	accounts := []dxoracle.NewEpochAccount{{Key: key(1)}}
+	for i, d := range delegations {
+		accounts = append(accounts, dxoracle.NewEpochAccount{Key: key(byte(10 + i)), Pool: key(0xa0), Drep: d})
+	}
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: conwayPParams(), Reserves: 10_000_000_000, Treasury: 1_000_000,
+		Accounts: accounts,
+		Pools:    []dxoracle.NewEpochPool{{Key: key(0xa0), Deposit: 500, RewardKey: key(1), RetiringEpoch: &retire}},
+	})
+	require.NoError(t, err)
+	for i, d := range delegations {
+		require.Equal(t, d, got.Accounts[i+1].Drep, "account %d", i)
+	}
 }

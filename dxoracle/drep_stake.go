@@ -51,6 +51,42 @@ type Delegation struct {
 	Key  []byte
 }
 
+// setDelegation stores d as acct's DRep delegation.
+func setDelegation(acct *models.Account, d Delegation) error {
+	switch d.Type {
+	case DelegateNone:
+	case DelegateKeyHash:
+		acct.DrepType, acct.Drep = models.DrepTypeAddrKeyHash, d.Key
+	case DelegateScriptHash:
+		acct.DrepType, acct.Drep = models.DrepTypeScriptHash, d.Key
+	case DelegateAlwaysAbstain:
+		acct.DrepType = models.DrepTypeAlwaysAbstain
+	case DelegateAlwaysNoConfidence:
+		acct.DrepType = models.DrepTypeAlwaysNoConfidence
+	default:
+		return fmt.Errorf("dxoracle: unknown delegation type %d", d.Type)
+	}
+	return nil
+}
+
+// delegationOf is the delegation an account row holds.
+func delegationOf(acct *models.Account) (Delegation, error) {
+	switch acct.DrepType {
+	case models.DrepTypeAddrKeyHash:
+		if len(acct.Drep) > 0 {
+			return Delegation{Type: DelegateKeyHash, Key: append([]byte(nil), acct.Drep...)}, nil
+		}
+		return Delegation{}, nil
+	case models.DrepTypeScriptHash:
+		return Delegation{Type: DelegateScriptHash, Key: append([]byte(nil), acct.Drep...)}, nil
+	case models.DrepTypeAlwaysAbstain:
+		return Delegation{Type: DelegateAlwaysAbstain}, nil
+	case models.DrepTypeAlwaysNoConfidence:
+		return Delegation{Type: DelegateAlwaysNoConfidence}, nil
+	}
+	return Delegation{}, fmt.Errorf("dxoracle: unknown stored DRep type %d", acct.DrepType)
+}
+
 // Account is a stake (reward) account row.
 type Account struct {
 	Tag             uint8
@@ -135,18 +171,8 @@ func (o *Oracle) seedDRepStake(
 			Active:          a.Active,
 			ExpirationEpoch: a.ExpirationEpoch,
 		}
-		switch a.Delegation.Type {
-		case DelegateNone:
-		case DelegateKeyHash:
-			acct.DrepType, acct.Drep = models.DrepTypeAddrKeyHash, a.Delegation.Key
-		case DelegateScriptHash:
-			acct.DrepType, acct.Drep = models.DrepTypeScriptHash, a.Delegation.Key
-		case DelegateAlwaysAbstain:
-			acct.DrepType = models.DrepTypeAlwaysAbstain
-		case DelegateAlwaysNoConfidence:
-			acct.DrepType = models.DrepTypeAlwaysNoConfidence
-		default:
-			return fmt.Errorf("dxoracle: unknown delegation type %d", a.Delegation.Type)
+		if err := setDelegation(acct, a.Delegation); err != nil {
+			return err
 		}
 		if err := o.db.CreateAccount(ctx, txn, acct); err != nil {
 			return fmt.Errorf("seed account: %w", err)
