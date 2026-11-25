@@ -22,18 +22,22 @@ import (
 	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 )
 
-// praosVRFNonceValue computes the nonce contribution from a Praos
-// (Babbage/Conway) block's VRF output. In Praos, the VRF output
-// is NOT used raw — it goes through domain separation and double
-// hashing matching the Haskell vrfNonceValue function:
+// PraosVRFNonceValue returns the nonce contribution of a Praos
+// (Babbage/Conway) block's raw VRF output. In Praos the output is NOT used
+// raw: it goes through domain separation and double hashing, matching the
+// Haskell vrfNonceValue function:
 //
 //	hashVRF SVRFNonce cert = blake2b_256("N" || rawVrfOutput)
 //	vrfNonceValue = blake2b_256(hashVRF result)
 //
-// This differs from TPraos (Shelley–Alonzo) which uses the raw
-// 64-byte NonceVrf output directly via coerce.
+// This differs from TPraos (Shelley–Alonzo), which hashes the raw 64-byte
+// NonceVrf output once.
 //
 // Ref: Ouroboros.Consensus.Protocol.Praos.VRF (vrfNonceValue, hashVRF)
+func PraosVRFNonceValue(vrfOutput []byte) []byte {
+	return praosVRFNonceValue(vrfOutput)
+}
+
 func praosVRFNonceValue(vrfOutput []byte) []byte {
 	// Step 1: range extension with domain separator "N"
 	tagged := make([]byte, 1+len(vrfOutput))

@@ -368,3 +368,14 @@ func TestAdvanceByronPBFTStateExported(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, trusted.IssuerState().SignatureHistory(), 3)
 }
+
+func TestCandidateFreezeCutoff(t *testing.T) {
+	t.Parallel()
+	// Blocks below the cutoff move the candidate; the cutoff is the epoch end
+	// less the window, or the epoch start once the window covers the epoch.
+	require.Equal(t, uint64(1_000), CandidateFreezeCutoff(0, 2_000, 1_000))
+	require.Equal(t, uint64(500_300), CandidateFreezeCutoff(500_000, 501_000, 700))
+	require.Equal(t, uint64(500_000), CandidateFreezeCutoff(500_000, 501_000, 1_000))
+	require.Equal(t, uint64(500_000), CandidateFreezeCutoff(500_000, 501_000, 5_000))
+	require.Equal(t, uint64(2_000), CandidateFreezeCutoff(0, 2_000, 0))
+}

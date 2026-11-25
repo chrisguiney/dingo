@@ -195,6 +195,20 @@ func ComputeNonceStabilityWindow(
 	return result.Uint64()
 }
 
+// CandidateFreezeCutoff returns the first slot at which the candidate nonce
+// is frozen: a block below it moves the candidate to the evolving nonce, a
+// block at or past it leaves the candidate unchanged. The cutoff is the
+// epoch's end slot less the stability window, and the epoch's start slot
+// once the window covers the whole epoch.
+func CandidateFreezeCutoff(
+	epochStartSlot, epochEndSlot, stabilityWindow uint64,
+) uint64 {
+	if stabilityWindow >= epochEndSlot-epochStartSlot {
+		return epochStartSlot
+	}
+	return epochEndSlot - stabilityWindow
+}
+
 // OpCertCounterResult is the outcome of CheckOpCertCounter.
 type OpCertCounterResult struct {
 	// Ok reports whether the header counter is acceptable.

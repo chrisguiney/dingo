@@ -15,9 +15,12 @@
 package eras_test
 
 import (
+	"bytes"
 	"testing"
 
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/blinklabs-io/dingo/ledger/eras"
 )
@@ -175,4 +178,13 @@ func TestIsCompatibleEra_AllAdjacentPairs(t *testing.T) {
 			},
 		)
 	}
+}
+
+func TestPraosVRFNonceValue(t *testing.T) {
+	t.Parallel()
+	out := bytes.Repeat([]byte{0xab}, 64)
+	got := eras.PraosVRFNonceValue(out)
+	inner := lcommon.Blake2b256Hash(append([]byte{'N'}, out...))
+	want := lcommon.Blake2b256Hash(inner.Bytes())
+	require.Equal(t, want.Bytes(), got)
 }

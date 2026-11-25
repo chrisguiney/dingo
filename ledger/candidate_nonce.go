@@ -246,12 +246,9 @@ func (ls *LedgerState) computeCandidateNonceAsOf(
 
 	// Determine the cutoff slot. Blocks at or past this slot do NOT
 	// update candidateNonce (it freezes), but still update evolvingNonce.
-	var cutoffSlot uint64
-	if stabilityWindow >= epochLengthInSlots {
-		cutoffSlot = epochStartSlot
-	} else {
-		cutoffSlot = epochEndSlot - stabilityWindow
-	}
+	cutoffSlot := CandidateFreezeCutoff(
+		epochStartSlot, epochEndSlot, stabilityWindow,
+	)
 
 	if foldEndSlot > epochEndSlot {
 		foldEndSlot = epochEndSlot
