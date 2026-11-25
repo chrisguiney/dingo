@@ -1659,14 +1659,6 @@ func ValidateTxFeeConway(
 	ls lcommon.LedgerState,
 	pp *conway.ConwayProtocolParameters,
 ) error {
-	txSize := TxSizeForFee(tx)
-	declaredEU, err := DeclaredExUnits(tx)
-	if err != nil {
-		return fmt.Errorf(
-			"calculating declared execution units: %w",
-			err,
-		)
-	}
 	refScriptSize, err := ReferencedScriptSize(tx, ls)
 	if err != nil {
 		return fmt.Errorf(
@@ -1685,9 +1677,8 @@ func ValidateTxFeeConway(
 	if pp.MinFeeRefScriptCostPerByte != nil {
 		refScriptCostPerByte = pp.MinFeeRefScriptCostPerByte.ToBigRat()
 	}
-	minFee := CalculateConwayMinFee(
-		txSize,
-		declaredEU,
+	minFee, err := MinFeeTx(
+		tx,
 		pp.MinFeeA,
 		pp.MinFeeB,
 		pricesMem,
@@ -1695,6 +1686,9 @@ func ValidateTxFeeConway(
 		refScriptSize,
 		refScriptCostPerByte,
 	)
+	if err != nil {
+		return err
+	}
 	txFee := tx.Fee()
 	if txFee == nil {
 		txFee = new(big.Int)
