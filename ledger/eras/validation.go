@@ -1450,22 +1450,18 @@ func ValidateTxFee(
 	pricesMem *big.Rat,
 	pricesSteps *big.Rat,
 ) error {
-	txSize := TxSizeForFee(tx)
-	declaredEU, err := DeclaredExUnits(tx)
-	if err != nil {
-		return fmt.Errorf(
-			"calculating declared execution units: %w",
-			err,
-		)
-	}
-	minFee := CalculateMinFee(
-		txSize,
-		declaredEU,
+	minFee, err := MinFeeTx(
+		tx,
 		minFeeA,
 		minFeeB,
 		pricesMem,
 		pricesSteps,
+		0,
+		nil,
 	)
+	if err != nil {
+		return err
+	}
 	txFee := tx.Fee()
 	if txFee == nil {
 		txFee = new(big.Int)

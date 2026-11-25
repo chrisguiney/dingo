@@ -5459,3 +5459,25 @@ func TestTxHasRedeemers(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, txHasRedeemers(withoutRedeemer))
 }
+
+func TestMinFeeTx(t *testing.T) {
+	t.Parallel()
+	tx := &mockConwayFeeTx{
+		mockFeeTx: mockFeeTx{
+			cbor:   make([]byte, 101),
+			txType: txTypeAlonzo,
+			fee:    big.NewInt(0),
+		},
+	}
+	costPerByte := big.NewRat(15, 1)
+	// The mock's CBOR is not a canonical envelope, so the fee-relevant size is
+	// its full length: 44*101 + 155381 = 159825, plus 30 reference script
+	// bytes at 15 lovelace each.
+	got, err := MinFeeTx(tx, 44, 155381, nil, nil, 30, costPerByte)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(159_825+450), got)
+
+	got, err = MinFeeTx(tx, 44, 155381, nil, nil, 0, nil)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(159_825), got)
+}
