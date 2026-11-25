@@ -520,25 +520,11 @@ func validateBlockSizes(
 }
 
 func (l blockProtocolLimits) checkHeaderSize(header gledger.BlockHeader) error {
-	if size := uint64(len(header.Cbor())); size > l.maxHeaderSize {
-		return fmt.Errorf(
-			"block header size %d exceeds maxBlockHeaderSize %d",
-			size,
-			l.maxHeaderSize,
-		)
-	}
-	return nil
+	return CheckHeaderSizeLimit(uint64(len(header.Cbor())), l.maxHeaderSize)
 }
 
 func (l blockProtocolLimits) checkBodySize(size uint64) error {
-	if size > l.maxBodySize {
-		return fmt.Errorf(
-			"block body size %d exceeds maxBlockBodySize %d",
-			size,
-			l.maxBodySize,
-		)
-	}
-	return nil
+	return CheckBodySizeLimit(size, l.maxBodySize)
 }
 
 // validateByronBlockSizes enforces the Byron block and header size limits.

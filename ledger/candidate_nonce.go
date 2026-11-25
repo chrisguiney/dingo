@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
 	"math/bits"
 	"slices"
 
@@ -580,10 +579,11 @@ func (ls *LedgerState) computeCandidateNonceSlow(
 		blockCount++
 
 		if block.Slot < candidateBound {
-			candidateNonce = make([]byte, len(evolvingNonce))
-			copy(candidateNonce, evolvingNonce)
 			preCutoffCount++
 		}
+		candidateNonce = AdvanceCandidateNonce(
+			evolvingNonce, candidateNonce, block.Slot, candidateBound,
+		)
 		return nil
 	}
 
@@ -697,30 +697,11 @@ func (ls *LedgerState) nonceStabilityWindow(eraId uint) uint64 {
 	if k <= 0 {
 		return 0
 	}
-	activeSlotsCoeff := shelleyGenesis.ActiveSlotsCoeff.Rat
-	if activeSlotsCoeff == nil ||
-		activeSlotsCoeff.Num().Sign() <= 0 {
-		return 0
-	}
-	multiplier, ok := nonceStabilityWindowKMultiplier(eraId)
-	if !ok {
-		return 0
-	}
-	// (multiplier * k) / f = (multiplier * k * f.denom) / f.num
-	numerator := new(big.Int).SetInt64(int64(k))
-	numerator.Mul(numerator, big.NewInt(multiplier))
-	numerator.Mul(numerator, activeSlotsCoeff.Denom())
-	denominator := new(big.Int).Set(activeSlotsCoeff.Num())
-	result := new(big.Int).Div(numerator, denominator)
-	// Ceiling division: if there's a remainder, add 1
-	remainder := new(big.Int).Mod(numerator, denominator)
-	if remainder.Sign() != 0 {
-		result.Add(result, big.NewInt(1))
-	}
-	if !result.IsUint64() {
-		return 0
-	}
-	return result.Uint64()
+	return ComputeNonceStabilityWindow(
+		eraId,
+		uint64(k),
+		shelleyGenesis.ActiveSlotsCoeff.Rat,
+	)
 }
 
 // nonceStabilityWindowKMultiplier returns the k multiplier for the
