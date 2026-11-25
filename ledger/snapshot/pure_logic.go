@@ -14,7 +14,9 @@
 
 package snapshot
 
-import "github.com/blinklabs-io/dingo/database/models"
+import (
+	"github.com/blinklabs-io/dingo/database/models"
+)
 
 // DedupeStakeInputs collapses rows that share a credential to the greatest
 // row by pool, then stake, then registration state. The result does not
@@ -51,4 +53,22 @@ func AggregateRewardStakeInputs(
 	dist *StakeDistribution,
 ) (*StakeDistribution, error) {
 	return rewardStakeDistribution(dist)
+}
+
+// ComputeSnapshotRotationEpochs returns the epochs whose stored snapshots
+// serve as the Set and Go snapshots once the boundary into newEpoch is
+// crossed. Dingo does not copy rows between snapshot kinds: the Mark snapshot
+// captured at the boundary is stored under newEpoch, the Set snapshot is the
+// one stored under newEpoch-1 and the Go snapshot the one under newEpoch-2,
+// each clamped at epoch 0.
+func ComputeSnapshotRotationEpochs(
+	newEpoch uint64,
+) (setEpoch, goEpoch uint64) {
+	if newEpoch > 0 {
+		setEpoch = newEpoch - 1
+	}
+	if newEpoch > 1 {
+		goEpoch = newEpoch - 2
+	}
+	return setEpoch, goEpoch
 }

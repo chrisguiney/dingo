@@ -15,13 +15,12 @@
 package snapshot
 
 import (
-	"testing"
-
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/database/types"
 	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"testing"
 )
 
 func pureHash(b byte) []byte {
@@ -124,4 +123,20 @@ func TestAggregateRewardStakeInputs(t *testing.T) {
 		_, err := AggregateRewardStakeInputs(nil)
 		require.Error(t, err)
 	})
+}
+
+func TestComputeSnapshotRotationEpochs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		newEpoch, wantSet, wantGo uint64
+	}{
+		{0, 0, 0},
+		{1, 0, 0},
+		{2, 1, 0},
+		{10, 9, 8},
+	} {
+		setEpoch, goEpoch := ComputeSnapshotRotationEpochs(tc.newEpoch)
+		assert.Equal(t, tc.wantSet, setEpoch, "set epoch for %d", tc.newEpoch)
+		assert.Equal(t, tc.wantGo, goEpoch, "go epoch for %d", tc.newEpoch)
+	}
 }

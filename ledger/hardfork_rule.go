@@ -17,7 +17,6 @@ package ledger
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/blinklabs-io/dingo/database/ledgerdb"
 )
@@ -97,15 +96,12 @@ func (ls *LedgerState) applyIntraEraHardForkRule(ctx context.Context,
 			)
 		}
 		if count > 0 {
-			if total > math.MaxUint64-reserves {
-				return fmt.Errorf(
-					"AVVM reserve credit overflows uint64: reserves %d, credit %d",
-					reserves,
-					total,
-				)
+			newReserves, err := creditAvvmReserves(reserves, total)
+			if err != nil {
+				return err
 			}
 			if err := ls.ledgerDB().SetNetworkState(
-				treasury, reserves+total, boundarySlot, txn,
+				treasury, newReserves, boundarySlot, txn,
 			); err != nil {
 				return fmt.Errorf("credit AVVM value to reserves: %w", err)
 			}
