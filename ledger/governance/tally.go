@@ -15,17 +15,14 @@
 package governance
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math/big"
-	"sort"
 
 	"github.com/blinklabs-io/dingo/database/ledgerdb"
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/database/types"
-	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 )
 
 // ProposalTally captures the aggregated vote totals for a governance
@@ -296,61 +293,9 @@ func loadDRepStakeDistribution(
 	if err != nil {
 		return nil, fmt.Errorf("active proposal deposit stake distribution: %w", err)
 	}
-	for key, amount := range deposits.Credential {
-		powers[key], err = addUint64(powers[key], amount)
-		if err != nil {
-			return nil, fmt.Errorf("drep stake distribution deposits: %w", err)
-		}
-	}
-	virtual[models.DrepTypeAlwaysAbstain], err = addUint64(
-		virtual[models.DrepTypeAlwaysAbstain], deposits.Abstain,
+	return BuildDRepStakeDistribution(
+		dreps, powers, virtual, DRepDepositPower(deposits),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("abstain stake distribution deposits: %w", err)
-	}
-	virtual[models.DrepTypeAlwaysNoConfidence], err = addUint64(
-		virtual[models.DrepTypeAlwaysNoConfidence], deposits.NoConfidence,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("no-confidence stake distribution deposits: %w", err)
-	}
-
-	ret := make([]models.DRepStakeDistributionEntry, 0, len(dreps)+2)
-	for _, drep := range dreps {
-		ref := models.NewStakeCredentialRef(
-			drep.CredentialTag,
-			drep.Credential,
-		)
-		stake := powers[ref.MapKey()]
-		if stake == 0 {
-			continue
-		}
-		ret = append(ret, models.DRepStakeDistributionEntry{
-			Credential:    append([]byte(nil), drep.Credential...),
-			Stake:         stake,
-			DRepType:      drep.CredentialTag,
-			CredentialTag: drep.CredentialTag,
-		})
-	}
-	sort.Slice(ret, func(i, j int) bool {
-		if ret[i].DRepType != ret[j].DRepType {
-			return ret[i].DRepType < ret[j].DRepType
-		}
-		return bytes.Compare(ret[i].Credential, ret[j].Credential) < 0
-	})
-	if stake := virtual[models.DrepTypeAlwaysAbstain]; stake > 0 {
-		ret = append(ret, models.DRepStakeDistributionEntry{
-			DRepType: uint8(models.DrepTypeAlwaysAbstain), //nolint:gosec // protocol enum is 2
-			Stake:    stake,
-		})
-	}
-	if stake := virtual[models.DrepTypeAlwaysNoConfidence]; stake > 0 {
-		ret = append(ret, models.DRepStakeDistributionEntry{
-			DRepType: uint8(models.DrepTypeAlwaysNoConfidence), //nolint:gosec // protocol enum is 3
-			Stake:    stake,
-		})
-	}
-	return ret, nil
 }
 
 // LoadDRepVotingState computes the DRep voting denominators for the
@@ -522,91 +467,7 @@ func tallyDRepVotes(
 		}
 	}
 
-	if len(state.Dreps) > 0 {
-		// Index votes by full DRep credential identity for O(1) lookup.
-		voteByCred := make(map[string]uint8, len(votes))
-		for _, v := range votes {
-			ref := models.StakeCredentialRef{
-				Tag: v.VoterCredentialTag,
-				Key: v.VoterCredential,
-			}
-			voteByCred[ref.MapKey()] = v.Vote
-		}
-
-		for _, drep := range state.Dreps {
-			ref := models.StakeCredentialRef{
-				Tag: drep.CredentialTag,
-				Key: drep.Credential,
-			}
-			power := state.Powers[ref.MapKey()]
-			var err error
-			tally.DRepTotalStake, err = addUint64(tally.DRepTotalStake, power)
-			if err != nil {
-				return fmt.Errorf("drep total stake: %w", err)
-			}
-
-			vote, voted := voteByCred[ref.MapKey()]
-			if !voted {
-				continue
-			}
-			switch vote {
-			case models.VoteYes:
-				tally.DRepYesStake, err = addUint64(tally.DRepYesStake, power)
-				if err != nil {
-					return fmt.Errorf("drep yes stake: %w", err)
-				}
-			case models.VoteNo:
-				tally.DRepNoStake, err = addUint64(tally.DRepNoStake, power)
-				if err != nil {
-					return fmt.Errorf("drep no stake: %w", err)
-				}
-			case models.VoteAbstain:
-				tally.DRepAbstainStake, err = addUint64(
-					tally.DRepAbstainStake, power,
-				)
-				if err != nil {
-					return fmt.Errorf("drep abstain stake: %w", err)
-				}
-			}
-		}
-	}
-
-	abstainPower := state.AbstainPower
-	noConfidencePower := state.NoConfidencePower
-	virtualPower, err := addUint64(abstainPower, noConfidencePower)
-	if err != nil {
-		return fmt.Errorf("drep virtual power: %w", err)
-	}
-	tally.DRepTotalStake, err = addUint64(tally.DRepTotalStake, virtualPower)
-	if err != nil {
-		return fmt.Errorf("drep total stake: %w", err)
-	}
-	tally.DRepAbstainStake, err = addUint64(
-		tally.DRepAbstainStake,
-		abstainPower,
-	)
-	if err != nil {
-		return fmt.Errorf("drep abstain stake: %w", err)
-	}
-	if noConfidencePower > 0 {
-		if lcommon.GovActionType(tally.ActionType) ==
-			lcommon.GovActionTypeNoConfidence {
-			tally.DRepYesStake, err = addUint64(
-				tally.DRepYesStake, noConfidencePower,
-			)
-			if err != nil {
-				return fmt.Errorf("drep yes stake: %w", err)
-			}
-		} else {
-			tally.DRepNoStake, err = addUint64(
-				tally.DRepNoStake, noConfidencePower,
-			)
-			if err != nil {
-				return fmt.Errorf("drep no stake: %w", err)
-			}
-		}
-	}
-	return nil
+	return TallyDRepVotes(state, votes, tally)
 }
 
 // tallySPOVotes computes SPO yes/no/abstain stake against the pool
@@ -827,105 +688,7 @@ func tallySPOVotes(
 		}
 	}
 
-	dist := state.Dist
-	tally.SPOTotalStake = state.TotalStake
-	if len(dist) == 0 {
-		return nil
-	}
-
-	// Explicit vote precedence: build a pool-keyed view first so we
-	// can short-circuit the auto-vote branch for pools that did vote.
-	voteByPool := make(map[string]uint8, len(votes))
-	for _, v := range votes {
-		voteByPool[string(v.VoterCredential)] = v.Vote
-	}
-
-	actionType := lcommon.GovActionType(tally.ActionType)
-	isHardForkInitiation := actionType ==
-		lcommon.GovActionTypeHardForkInitiation
-	inBootstrap := tc.MajorVersion == bootstrapProtocolVersion
-	isNoConfidenceAction := actionType ==
-		lcommon.GovActionTypeNoConfidence
-
-	for _, s := range dist {
-		stake := uint64(s.TotalStake)
-		var err error
-
-		if v, voted := voteByPool[string(s.PoolKeyHash)]; voted {
-			switch v {
-			case models.VoteYes:
-				tally.SPOYesStake, err = addUint64(tally.SPOYesStake, stake)
-				if err != nil {
-					return fmt.Errorf("spo yes stake: %w", err)
-				}
-			case models.VoteNo:
-				tally.SPONoStake, err = addUint64(tally.SPONoStake, stake)
-				if err != nil {
-					return fmt.Errorf("spo no stake: %w", err)
-				}
-			case models.VoteAbstain:
-				tally.SPOAbstainStake, err = addUint64(
-					tally.SPOAbstainStake, stake,
-				)
-				if err != nil {
-					return fmt.Errorf("spo abstain stake: %w", err)
-				}
-			}
-			continue
-		}
-
-		// The reference RATIFY rule applies non-voter semantics before
-		// consulting reward-account defaults. HardForkInitiation always
-		// keeps silent-pool stake in the active denominator as implicit No.
-		if isHardForkInitiation {
-			continue
-		}
-		// During Conway bootstrap, every other silent pool is Abstain and
-		// therefore excluded from the active SPO denominator.
-		if inBootstrap {
-			tally.SPOAbstainStake, err = addUint64(
-				tally.SPOAbstainStake, stake,
-			)
-			if err != nil {
-				return fmt.Errorf("spo abstain stake: %w", err)
-			}
-			continue
-		}
-
-		// Only trust RewardAccountAutoVote when the row is flagged
-		// as resolved after the action/version-specific non-voter rules
-		// above. Unresolved rows (Mithril-imported set/go rotations, or
-		// rows written by pre-CIP-1694 code) then fall back to
-		// PoolRewardAccountAutoVoteNone — implicit no — so stale or
-		// never-computed values can never silently bucket stake into
-		// Abstain or NoConfidence.
-		if !s.RewardAccountAutoVoteResolved {
-			continue
-		}
-		switch s.RewardAccountAutoVote {
-		case models.PoolRewardAccountAutoVoteAbstain:
-			tally.SPOAbstainStake, err = addUint64(tally.SPOAbstainStake, stake)
-			if err != nil {
-				return fmt.Errorf("spo abstain stake: %w", err)
-			}
-		case models.PoolRewardAccountAutoVoteNoConfidence:
-			if isNoConfidenceAction {
-				tally.SPOYesStake, err = addUint64(tally.SPOYesStake, stake)
-				if err != nil {
-					return fmt.Errorf("spo yes stake: %w", err)
-				}
-			} else {
-				tally.SPONoStake, err = addUint64(tally.SPONoStake, stake)
-				if err != nil {
-					return fmt.Errorf("spo no stake: %w", err)
-				}
-			}
-		case models.PoolRewardAccountAutoVoteNone:
-			// No auto-vote: pool contributes only to SPOTotalStake
-			// (implicit no under CIP-1694).
-		}
-	}
-	return nil
+	return TallySPOVotes(state, tc.MajorVersion, votes, tally)
 }
 
 // tallyCCVotes counts per-member votes restricted to currently active,
@@ -946,38 +709,7 @@ func tallyCCVotes(
 			return err
 		}
 	}
-	tally.CCTotalCount = committeeState.ActiveMemberCount
-
-	votesByHotCredential := make(map[string]uint8, len(votes))
-	for _, vote := range votes {
-		credentialKey := models.CommitteeCredential{
-			CredentialTag: vote.VoterCredentialTag,
-			Credential:    vote.VoterCredential,
-		}.Key()
-		if _, ok := committeeState.HotCredentialPresence[credentialKey]; ok {
-			votesByHotCredential[credentialKey] = vote.Vote
-		}
-	}
-
-	for _, hotCredential := range committeeState.MemberHotCredentials {
-		// Distinguish "no vote cast" from VoteNo. Both vote, voted are
-		// needed because models.VoteNo is the zero value of uint8 and
-		// would otherwise count every non-voting active CC member as
-		// a No vote, inflating CCNoCount.
-		vote, voted := votesByHotCredential[hotCredential]
-		if !voted {
-			continue
-		}
-		switch vote {
-		case models.VoteYes:
-			tally.CCYesCount++
-		case models.VoteNo:
-			tally.CCNoCount++
-		case models.VoteAbstain:
-			tally.CCAbstainCount++
-		}
-	}
-	return nil
+	return TallyCCVotes(committeeState, votes, tally)
 }
 
 // DRepYesRatio returns yesStake / (totalActiveStake - abstainStake) per
