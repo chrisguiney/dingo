@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/blinklabs-io/dingo/database/ledgerdb"
 	"github.com/blinklabs-io/dingo/database/models"
@@ -99,40 +98,20 @@ func EnactProposal(
 	}
 
 	refundSource := proposalRewardSourceHash(proposal)
+	pparamsResult, handled, err := ApplyPParamsEnactment(
+		ctx.PParams, action, ctx.UpdateFn,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		result = pparamsResult
+	}
 	switch a := action.(type) {
-	case *conway.ConwayParameterChangeGovAction:
-		updated, err := ctx.UpdateFn(ctx.PParams, a.ParamUpdate)
-		if err != nil {
-			return nil, fmt.Errorf("apply param update: %w", err)
-		}
-		result.UpdatedPParams = updated
-		result.PParamsChanged = true
-		if _, ok := a.ParamUpdate.CostModels[1]; ok {
-			result.PlutusV2CostModelWritten = true
-		}
-
-	case *gdijkstra.DijkstraParameterChangeGovAction:
-		updated, err := ctx.UpdateFn(ctx.PParams, a.ParamUpdate)
-		if err != nil {
-			return nil, fmt.Errorf("apply param update: %w", err)
-		}
-		result.UpdatedPParams = updated
-		result.PParamsChanged = true
-		if _, ok := a.ParamUpdate.CostModels[1]; ok {
-			result.PlutusV2CostModelWritten = true
-		}
-
-	case *lcommon.HardForkInitiationGovAction:
-		updated, err := setProtocolVersion(
-			ctx.PParams,
-			a.ProtocolVersion.Major,
-			a.ProtocolVersion.Minor,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("schedule hard fork: %w", err)
-		}
-		result.UpdatedPParams = updated
-		result.PParamsChanged = true
+	case *conway.ConwayParameterChangeGovAction,
+		*gdijkstra.DijkstraParameterChangeGovAction,
+		*lcommon.HardForkInitiationGovAction:
+		// Applied by ApplyPParamsEnactment above.
 
 	case *lcommon.TreasuryWithdrawalGovAction:
 		if err := applyTreasuryWithdrawal(requestCtx, ctx, a, proposal); err != nil {
@@ -586,82 +565,28 @@ func applyUpdateCommittee(
 			continuingTermStart[key] = member.TermStartSlot
 		}
 	}
-	removeCredentials := make(
-		[]models.CommitteeCredential,
-		0,
-		len(a.Credentials),
+	plan, err := PlanCommitteeUpdate(
+		a, continuingTermStart, termStartSlot, ctx.PrevEpochStartSlot, ctx.Slot,
 	)
-	for _, c := range a.Credentials {
-		credentialTag, err := models.CredentialTagFromUint(c.CredType)
-		if err != nil {
-			return fmt.Errorf("remove member credential: %w", err)
-		}
-		hash := c.Credential
-		removeCredentials = append(
-			removeCredentials,
-			models.CommitteeCredential{
-				CredentialTag: credentialTag,
-				Credential:    hash[:],
-			},
-		)
+	if err != nil {
+		return err
 	}
 	if err := ctx.DB.SoftDeleteCommitteeMembers(
 		requestCtx,
-		removeCredentials, ctx.Slot, ctx.Txn,
+		plan.Remove, ctx.Slot, ctx.Txn,
 	); err != nil {
 		return fmt.Errorf("remove members: %w", err)
 	}
 	if err := ctx.DB.SetCommitteeQuorum(
 		requestCtx,
-		a.Quorum.Rat, ctx.Slot, ctx.Txn,
+		plan.Quorum, ctx.Slot, ctx.Txn,
 	); err != nil {
 		return fmt.Errorf("set committee quorum: %w", err)
 	}
-	if len(a.CredEpochs) == 0 {
+	if len(plan.Add) == 0 {
 		return nil
 	}
-	members := make([]*models.CommitteeMember, 0, len(a.CredEpochs))
-	for cred, expiry := range a.CredEpochs {
-		if cred == nil {
-			continue
-		}
-		hash := cred.Credential
-		credentialTag, err := models.CredentialTagFromUint(cred.CredType)
-		if err != nil {
-			return fmt.Errorf("add member credential: %w", err)
-		}
-		memberTermStart := max(termStartSlot, ctx.PrevEpochStartSlot)
-		key := models.CommitteeCredential{
-			CredentialTag: credentialTag,
-			Credential:    hash[:],
-		}.Key()
-		if priorTermStart, ok := continuingTermStart[key]; ok {
-			memberTermStart = priorTermStart
-		}
-		members = append(members, &models.CommitteeMember{
-			ColdCredentialTag: credentialTag,
-			ColdCredHash:      hash[:],
-			ExpiresEpoch:      uint64(expiry),
-			TermStartSlot:     memberTermStart,
-			TermStartSlotSet:  true,
-			AddedSlot:         ctx.Slot,
-		})
-	}
-	if len(members) == 0 {
-		return nil
-	}
-	// Sort by full cold credential identity so the auto-increment ID assigned
-	// by the DB is stable across nodes (Go map iteration is random).
-	sort.Slice(members, func(i, j int) bool {
-		if cmp := bytes.Compare(
-			members[i].ColdCredHash,
-			members[j].ColdCredHash,
-		); cmp != 0 {
-			return cmp < 0
-		}
-		return members[i].ColdCredentialTag < members[j].ColdCredentialTag
-	})
-	return ctx.DB.SetCommitteeMembers(requestCtx, members, ctx.Txn)
+	return ctx.DB.SetCommitteeMembers(requestCtx, plan.Add, ctx.Txn)
 }
 
 // decodeGovAction re-hydrates the GovAction value from its CBOR form.

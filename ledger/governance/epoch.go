@@ -1788,122 +1788,60 @@ func removeOrphanedProposalsFromSet(
 	slot uint64,
 	logger *slog.Logger,
 ) (int, error) {
-	children := make(map[string][]*models.GovernanceProposal)
-	for _, proposal := range active {
-		children[proposalParentKey(proposal)] = append(
-			children[proposalParentKey(proposal)],
-			proposal,
-		)
-	}
-	enactmentSeeds := make([]*models.GovernanceProposal, 0)
-	for _, winner := range enacted {
-		winnerPurpose := govActionPurposeOf(
-			lcommon.GovActionType(winner.ActionType),
-		)
-		if winnerPurpose == purposeNone {
-			continue
-		}
-		for _, sibling := range children[proposalParentKey(winner)] {
-			if govActionPurposeOf(
-				lcommon.GovActionType(sibling.ActionType),
-			) == winnerPurpose {
-				enactmentSeeds = append(enactmentSeeds, sibling)
-			}
-		}
-	}
-	expirySeeds := make([]*models.GovernanceProposal, 0, len(expired))
-	for _, proposal := range expired {
-		expirySeeds = append(
-			expirySeeds, children[proposalIdentityKey(proposal)]...,
-		)
-	}
-	dropSeeds := make([]*models.GovernanceProposal, 0, len(dropped))
-	for _, proposal := range dropped {
-		dropSeeds = append(
-			dropSeeds, children[proposalIdentityKey(proposal)]...,
-		)
-	}
-
 	// cardano-ledger removes competing siblings of an enacted action in the
 	// same EPOCH tick as the enactment and unions them with the enacted
 	// action's own deposit before calling returnProposalDeposits (Conway
 	// Rules/Epoch.hs `allRemovedGovActions`), so an enactment-driven removal
 	// refunds now, exactly like the winner's deposit did in EnactProposal.
 	// Only the expiry-driven sweep defers deposit return, because the proposal
-	// is removed from the tree one boundary after expiry is recorded. The
-	// enactment sweep runs first so a proposal reachable both ways follows
-	// enactment timing.
-	removed := make(map[string]struct{})
+	// is removed from the tree one boundary after expiry is recorded.
 	count := 0
-	sweep := func(
-		seeds []*models.GovernanceProposal,
-		refundNow bool,
-	) error {
-		queue := append(
-			make([]*models.GovernanceProposal, 0, len(seeds)), seeds...,
-		)
-		for len(queue) > 0 {
-			proposal := queue[0]
-			queue = queue[1:]
-			identity := proposalIdentityKey(proposal)
-			if _, ok := removed[identity]; ok {
-				continue
-			}
-			removed[identity] = struct{}{}
-			expiredEpoch := epoch
-			expiredSlot := slot
-			proposal.ExpiredEpoch = &expiredEpoch
-			proposal.ExpiredSlot = &expiredSlot
-			if refundNow {
-				if err := refundProposalDeposit(
-					ctx,
-					db, txn, proposal, slot,
-				); err != nil {
-					return fmt.Errorf(
-						"refund removed proposal deposit %s#%d: %w",
-						shortHash(proposal.TxHash),
-						proposal.ActionIndex,
-						err,
-					)
-				}
-				// Stamping the drop here keeps the refund a single event:
-				// the DROP step skips a proposal that already carries
-				// dropped_epoch, and a reprocessed boundary replays this
-				// refund through GetDroppedGovernanceProposalsAt instead of
-				// issuing a second one.
-				droppedEpoch := epoch
-				droppedSlot := slot
-				proposal.DroppedEpoch = &droppedEpoch
-				proposal.DroppedSlot = &droppedSlot
-			}
-			if err := db.SetGovernanceProposal(ctx, proposal, txn); err != nil {
-				return fmt.Errorf(
-					"mark removed proposal expired %s#%d: %w",
-					shortHash(proposal.TxHash), proposal.ActionIndex, err,
+	for _, removal := range PlanOrphanRemovals(
+		enacted, expired, dropped, active,
+	) {
+		proposal := removal.Proposal
+		expiredEpoch := epoch
+		expiredSlot := slot
+		proposal.ExpiredEpoch = &expiredEpoch
+		proposal.ExpiredSlot = &expiredSlot
+		if removal.RefundNow {
+			if err := refundProposalDeposit(
+				ctx,
+				db, txn, proposal, slot,
+			); err != nil {
+				return count, fmt.Errorf(
+					"refund removed proposal deposit %s#%d: %w",
+					shortHash(proposal.TxHash),
+					proposal.ActionIndex,
+					err,
 				)
 			}
-			if logger != nil {
-				logger.Info(
-					"removed competing governance proposal",
-					"component", "governance",
-					"tx_hash", shortHash(proposal.TxHash),
-					"action_index", proposal.ActionIndex,
-					"epoch", epoch,
-				)
-			}
-			queue = append(queue, children[identity]...)
-			count++
+			// Stamping the drop here keeps the refund a single event:
+			// the DROP step skips a proposal that already carries
+			// dropped_epoch, and a reprocessed boundary replays this
+			// refund through GetDroppedGovernanceProposalsAt instead of
+			// issuing a second one.
+			droppedEpoch := epoch
+			droppedSlot := slot
+			proposal.DroppedEpoch = &droppedEpoch
+			proposal.DroppedSlot = &droppedSlot
 		}
-		return nil
-	}
-	if err := sweep(enactmentSeeds, true); err != nil {
-		return count, err
-	}
-	if err := sweep(expirySeeds, false); err != nil {
-		return count, err
-	}
-	if err := sweep(dropSeeds, true); err != nil {
-		return count, err
+		if err := db.SetGovernanceProposal(ctx, proposal, txn); err != nil {
+			return count, fmt.Errorf(
+				"mark removed proposal expired %s#%d: %w",
+				shortHash(proposal.TxHash), proposal.ActionIndex, err,
+			)
+		}
+		if logger != nil {
+			logger.Info(
+				"removed competing governance proposal",
+				"component", "governance",
+				"tx_hash", shortHash(proposal.TxHash),
+				"action_index", proposal.ActionIndex,
+				"epoch", epoch,
+			)
+		}
+		count++
 	}
 	return count, nil
 }
@@ -1970,27 +1908,23 @@ func conwayRatifyQuorum(
 	txn ledgerdb.Txn,
 	genesis *conway.ConwayGenesis,
 ) (*big.Rat, error) {
+	var enacted *big.Rat
 	if db != nil {
-		quorum, err := db.GetCommitteeQuorum(ctx, txn)
+		var err error
+		enacted, err = db.GetCommitteeQuorum(ctx, txn)
 		if err != nil {
 			return nil, err
 		}
-		if quorum != nil {
-			return quorum, nil
-		}
 	}
-	if genesis != nil && genesis.Committee.Threshold != nil &&
-		genesis.Committee.Threshold.Rat != nil {
-		return genesis.Committee.Threshold.Rat, nil
-	}
-	if logger != nil {
+	quorum, usedDefault := SelectCommitteeQuorum(enacted, genesis)
+	if usedDefault && logger != nil {
 		logger.Debug(
 			"using fallback CC quorum (Conway genesis unavailable)",
 			"quorum", "2/3",
 			"component", "governance",
 		)
 	}
-	return defaultCCQuorum, nil
+	return quorum, nil
 }
 
 // EffectiveCommitteeQuorum returns the committee quorum currently in force:

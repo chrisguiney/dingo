@@ -667,7 +667,7 @@ func BumpDormantDRepExpiryAtEpochBoundary(
 	if err != nil {
 		return fmt.Errorf("get active proposals for DRep dormancy: %w", err)
 	}
-	if len(proposals) != 0 {
+	if !ShouldBumpDormantDRepExpiry(len(proposals)) {
 		return nil
 	}
 	if _, err := db.BumpDormantDRepExpiries(ctx, slot, txn); err != nil {
