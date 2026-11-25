@@ -219,8 +219,9 @@ func (d *Database) pparamEnactmentPending(
 				err,
 			)
 		}
-		uniqueCount = classicPParamProposers(pparamUpdates, submissionEpoch)
-		pending = uniqueCount > 0 && uniqueCount >= quorum
+		uniqueCount, pending = ClassicPParamQuorumPossible(
+			pparamUpdates, submissionEpoch, quorum,
+		)
 		return nil
 	}); err != nil {
 		return false, err

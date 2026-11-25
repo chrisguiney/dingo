@@ -17,12 +17,10 @@ package ledger
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/blinklabs-io/dingo/database/ledgerdb"
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/database/types"
-	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 	ocommon "github.com/blinklabs-io/gouroboros/protocol/common"
 )
 
@@ -75,32 +73,29 @@ func (ls *LedgerState) removeAvvmUtxos(ctx context.Context,
 				u.TxId[:8], u.OutputIdx, err,
 			)
 		}
-		addr := out.Address()
-		if addr.Type() != lcommon.AddressTypeByron {
-			return nil
-		}
-		if addr.ByronType() != lcommon.ByronAddressTypeRedeem {
-			return nil
-		}
-		amount := out.Amount()
-		if amount == nil || amount.Sign() < 0 || !amount.IsUint64() {
+		isAvvm, amountUint64, err := ClassifyAvvmOutput(
+			out.Address(), out.Amount(),
+		)
+		if err != nil {
 			return fmt.Errorf(
-				"AVVM UTxO %x#%d has invalid amount %v",
-				u.TxId[:8], u.OutputIdx, amount,
+				"AVVM UTxO %x#%d has %w",
+				u.TxId[:8], u.OutputIdx, err,
 			)
 		}
-		amountUint64 := amount.Uint64()
+		if !isAvvm {
+			return nil
+		}
 		refs = append(refs, types.UtxoKey{
 			TxId:      u.TxId,
 			OutputIdx: u.OutputIdx,
 		})
-		if totalLovelace > math.MaxUint64-amountUint64 {
+		totalLovelace, err = addAvvmLovelace(totalLovelace, amountUint64)
+		if err != nil {
 			return fmt.Errorf(
-				"AVVM lovelace total overflows uint64 at tx %x#%d",
-				u.TxId[:8], u.OutputIdx,
+				"%w at tx %x#%d",
+				err, u.TxId[:8], u.OutputIdx,
 			)
 		}
-		totalLovelace += amountUint64
 		return nil
 	}); err != nil {
 		return 0, 0, fmt.Errorf("scan live utxos: %w", err)

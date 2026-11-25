@@ -1126,14 +1126,7 @@ func (m *Manager) rotateSnapshots(ctx context.Context, newEpoch uint64) {
 	// addressed by older epoch numbers rather than by copying rows between
 	// snapshot types.
 
-	goEpoch := uint64(0)
-	setEpoch := uint64(0)
-	if newEpoch > 1 {
-		goEpoch = newEpoch - 2
-	}
-	if newEpoch > 0 {
-		setEpoch = newEpoch - 1
-	}
+	setEpoch, goEpoch := ComputeSnapshotRotationEpochs(newEpoch)
 
 	m.logger.Debug(
 		"snapshot rotation conceptual",

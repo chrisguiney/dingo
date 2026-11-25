@@ -52,8 +52,12 @@ func (e *Engine) ApplyEpochDonations(
 		treasury = uint64(state.Treasury)
 		reserves = uint64(state.Reserves)
 	}
+	newTreasury, err := ComputeEpochDonations(treasury, donations)
+	if err != nil {
+		return err
+	}
 	if err := e.ledgerDB().SetNetworkState(
-		treasury+donations,
+		newTreasury,
 		reserves,
 		boundarySlot,
 		txn,

@@ -113,11 +113,13 @@ func (e *Engine) ApplyPoolReapRefunds(ctx context.Context,
 				refund.PoolKeyHash, err,
 			)
 		}
-		if !credited {
+		if _, unclaimed := SplitPoolReapDeposit(
+			deposit, credited,
+		); unclaimed > 0 {
 			if err := governance.AddUnclaimedToTreasury(
 				e.ledgerDB(),
 				txn,
-				deposit,
+				unclaimed,
 				boundarySlot,
 			); err != nil {
 				return fmt.Errorf(

@@ -19,12 +19,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math/big"
 
 	"github.com/blinklabs-io/dingo/database/ledgerdb"
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/ledger/governance"
-	"github.com/blinklabs-io/gouroboros/ledger/alonzo"
 )
 
 const (
@@ -135,21 +133,15 @@ func (e *Engine) ApplyMIRCerts(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("apply MIR certs: %w", err)
 	}
-	availableReserves, reservesOk := boundary.availablePot(
-		MIRPotReserves,
+	availableReserves, availableTreasury, fits := boundary.capacity(
 		reserves,
-	)
-	availableTreasury, treasuryOk := boundary.availablePot(
-		MIRPotTreasury,
 		treasury,
 	)
 	if boundary.discard != "" {
 		e.discardMIRBoundary(boundarySlot, boundary.discard)
 		return nil
 	}
-	if !reservesOk || !treasuryOk ||
-		boundary.totalReserves > availableReserves ||
-		boundary.totalTreasury > availableTreasury {
+	if !fits {
 		e.config.Logger.Warn(
 			"skipping over-budget MIR at epoch boundary",
 			"slot", boundarySlot,
@@ -295,22 +287,10 @@ func (b *mirBoundary) addTransfer(sourcePot uint, amount uint64) {
 }
 
 // collectMIRBoundary folds every effect for the ended epoch into a single
-// mirBoundary without mutating any state. Distribution deltas are accumulated
-// per (pot, credential) as signed values first, then resolved into credits, so
-// a negative delta reduces an earlier positive one instead of being applied as
-// a debit the reward-account path cannot represent. Credits are restricted to
-// registered, active reward accounts, resolved in one batched lookup.
-//
-// The accumulation preserves first-appearance order. Effects arrive ordered by
-// added_slot then row ID and each certificate's rewards by row ID, so the
-// resulting credit order — and therefore the reward journal — is deterministic
-// for a given stored epoch.
-//
-// epochEraID gates how a repeated (pot, credential) entry combines with its
-// running total: additively for era >= Alonzo, matching `Map.unionWith (<>)`,
-// or replaced by the latest certificate's amount below Alonzo, matching
-// `Map.union`'s left bias on the newer entry. See the era discussion on
-// ApplyMIRCerts.
+// mirBoundary without mutating any state; the fold itself is foldMIRBoundary.
+// Effects arrive ordered by added_slot then row ID and each certificate's
+// rewards by row ID, so the resulting credit order — and therefore the reward
+// journal — is deterministic for a given stored epoch.
 func (e *Engine) collectMIRBoundary(ctx context.Context,
 	txn ledgerdb.Txn,
 	effects []models.MIREffect,
@@ -320,91 +300,7 @@ func (e *Engine) collectMIRBoundary(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	additive := epochEraID >= alonzo.EraIdAlonzo
-	boundary := &mirBoundary{}
-	pending := make(map[MIRPendingKey]*big.Int)
-	order := make([]MIRPendingKey, 0, len(effects))
-	for _, effect := range effects {
-		if effect.OtherPot > 0 {
-			boundary.addTransfer(effect.Pot, effect.OtherPot)
-			if boundary.discard != "" {
-				return boundary, nil
-			}
-			continue
-		}
-		if effect.Pot != MIRPotReserves && effect.Pot != MIRPotTreasury {
-			boundary.discard = fmt.Sprintf(
-				"unknown MIR source pot %d", effect.Pot,
-			)
-			return boundary, nil
-		}
-		for _, reward := range effect.Rewards {
-			ref := models.NewStakeCredentialRef(
-				reward.CredentialTag, reward.Credential,
-			)
-			if !registered[ref.MapKey()] {
-				continue
-			}
-			if reward.Amount == nil {
-				return nil, fmt.Errorf(
-					"MIR %d carries no delta for credential %x",
-					effect.ID,
-					reward.Credential,
-				)
-			}
-			key := MIRPendingKey{
-				Pot:        effect.Pot,
-				Tag:        reward.CredentialTag,
-				Credential: string(reward.Credential),
-			}
-			total, ok := pending[key]
-			if !ok {
-				total = new(big.Int)
-				pending[key] = total
-				order = append(order, key)
-			}
-			if additive {
-				total.Add(total, reward.Amount)
-			} else {
-				total.Set(reward.Amount)
-			}
-		}
-	}
-	for _, key := range order {
-		net := pending[key]
-		if net.Sign() == 0 {
-			continue
-		}
-		if net.Sign() < 0 {
-			boundary.discard = fmt.Sprintf(
-				"MIR deltas for pot %d credential %x net to %s, "+
-					"which no reward account can carry",
-				key.Pot,
-				key.Credential,
-				net,
-			)
-			return boundary, nil
-		}
-		if !net.IsUint64() {
-			boundary.discard = fmt.Sprintf(
-				"MIR deltas for pot %d credential %x net to %s, which exceeds any Ada pot",
-				key.Pot,
-				key.Credential,
-				net,
-			)
-			return boundary, nil
-		}
-		boundary.addCredit(mirCredit{
-			pot:           key.Pot,
-			credentialTag: key.Tag,
-			credential:    []byte(key.Credential),
-			amount:        net.Uint64(),
-		})
-		if boundary.discard != "" {
-			return boundary, nil
-		}
-	}
-	return boundary, nil
+	return foldMIRBoundary(effects, registered, epochEraID)
 }
 
 // registeredMIRAccounts returns the set of distribution credentials that have a
