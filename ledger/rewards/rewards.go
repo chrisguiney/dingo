@@ -325,38 +325,21 @@ func Calculate(
 	if err != nil {
 		return nil, err
 	}
-	expectedBlocks := expectedBlocks(params)
-	if expectedBlocks.Sign() == 0 &&
-		params.Decentralization.Cmp(new(big.Rat).SetFrac64(4, 5)) < 0 {
-		return nil, fmt.Errorf(
-			"%w: expected blocks is zero",
-			ErrInvalidParameters,
-		)
-	}
-	efficiency := Efficiency(
-		totalBlocks,
+	expansion, err := ComputeMonetaryExpansion(
 		params,
-	)
-	incentives, err := floorMulChecked(
-		minRat(oneRat(), efficiency),
-		params.MonetaryExpansion,
-		uintRat(pots.Reserves),
+		pots.Reserves,
+		pots.Fees,
+		totalBlocks,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("calculate incentives: %w", err)
+		return nil, err
 	}
-	totalRewardPot, overflow := addUint64(incentives, pots.Fees)
-	if overflow {
-		return nil, fmt.Errorf("%w: reward pot overflow", ErrInvalidParameters)
-	}
-	treasuryTax, err := floorMulChecked(
-		params.TreasuryExpansion,
-		uintRat(totalRewardPot),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("calculate treasury tax: %w", err)
-	}
-	availableRewards := totalRewardPot - treasuryTax
+	incentives := expansion.DeltaR1
+	totalRewardPot := expansion.RewardPot
+	treasuryTax := expansion.TreasuryCut
+	availableRewards := expansion.PoolPot
+	efficiency := expansion.Eta
+	expectedBlocks := expansion.ExpectedBlocks
 	treasuryAfterTax, overflow := addUint64(pots.Treasury, treasuryTax)
 	if overflow {
 		return nil, fmt.Errorf(
