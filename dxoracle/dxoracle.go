@@ -33,7 +33,6 @@ import (
 	"github.com/blinklabs-io/dingo/database/plugin/immutable/chunkfile"
 	"github.com/blinklabs-io/dingo/database/plugin/metadata"
 	"github.com/blinklabs-io/dingo/database/plugin/metadata/sqlite"
-	"github.com/blinklabs-io/dingo/internal/test/testutil"
 	"github.com/blinklabs-io/dingo/plugin"
 	_ "modernc.org/sqlite"
 )
@@ -82,7 +81,7 @@ func Open(dataDir string) (*Oracle, error) {
 	}
 	blobStore, err := plugin.Resolve[blob.BlobStore](
 		ctx, host, plugin.CapabilityStorageBlob, "badger",
-		testutil.BadgerBlobConfig(),
+		badgerBlobConfig(),
 		blob.ProviderDependencies{
 			DataDir: dataDir, StorageMode: config.StorageMode,
 			Logger: config.Logger,

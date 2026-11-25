@@ -70,8 +70,8 @@ func (p *DingoStateProvider) SetForecastHorizon(
 
 // NetworkId returns the network identifier
 func (p *DingoStateProvider) NetworkId() uint {
-	// Default to testnet (0) for conformance tests
-	return 0
+	// Default to testnet (0) for conformance tests unless a caller set one.
+	return p.manager.networkID
 }
 
 // EpochForSlot returns the epoch carried by the current conformance state.

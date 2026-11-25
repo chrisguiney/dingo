@@ -10219,20 +10219,8 @@ func (ls *LedgerState) ledgerProcessBlock(
 		tracing.End(span, err)
 	}()
 	// Check that we're processing things in order
-	if len(expectedPrevHash) > 0 {
-		if string(
-			block.PrevHash().Bytes(),
-		) != string(
-			expectedPrevHash,
-		) {
-			return nil, fmt.Errorf(
-				"%w: block %s (with prev hash %s) does not fit on current chain tip (%x)",
-				errStaleChainIterator,
-				block.Hash().String(),
-				block.PrevHash().String(),
-				expectedPrevHash,
-			)
-		}
+	if err := checkBlockPrevHash(expectedPrevHash, block); err != nil {
+		return nil, err
 	}
 	// Enforce configured chain checkpoints regardless of validation mode.
 	// A block at a checkpointed height whose hash differs sits on a chain

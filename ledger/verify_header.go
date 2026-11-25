@@ -2136,16 +2136,10 @@ func (ls *LedgerState) ProtocolParameterUpdateWindow(
 	if epoch.StartSlot > ^uint64(0)-epochLength {
 		return 0, 0, errors.New("epoch end slot overflows")
 	}
-	// The reference point of no return is the next epoch's first slot less
-	// twice the stability window, where the window is ceiling(3k/f)
-	// (Cardano.Ledger.Slot.getTheSlotOfNoReturn). Doubling the rounded window
-	// is not floor(6k/f): the two differ whenever 3k/f is not an integer.
-	// When the voting window covers the whole epoch every slot targets the
-	// next epoch, which the epoch's first slot expresses.
-	if stabilityWindow > (^uint64(0))/2 || 2*stabilityWindow >= epochLength {
-		return epoch.EpochId, epoch.StartSlot, nil
-	}
-	return epoch.EpochId, epoch.StartSlot + epochLength - 2*stabilityWindow, nil
+	id, noReturn := ClassicPParamUpdateWindow(
+		epoch.EpochId, epoch.StartSlot, epochLength, stabilityWindow,
+	)
+	return id, noReturn, nil
 }
 
 func classifyGenesisOverlaySlot(

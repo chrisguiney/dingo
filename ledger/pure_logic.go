@@ -25,6 +25,8 @@ import (
 	byronconsensus "github.com/blinklabs-io/gouroboros/consensus/byron"
 	"github.com/blinklabs-io/gouroboros/ledger/byron"
 	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/ledger/shelley"
+	"maps"
 	"math"
 	"math/big"
 	"time"
@@ -648,6 +650,24 @@ func (s byronPBFTState) UpdateState() byronupdate.State {
 	return s.update
 }
 
+// WithUpdateState returns the state with its update-system state replaced, for
+// a caller that holds the update state at a point other than genesis.
+func (s byronPBFTState) WithUpdateState(
+	update byronupdate.State,
+) ByronPBFTState {
+	s.update = update
+	return s
+}
+
+// WithIssuerState returns the state with its PBFT signature window replaced,
+// for a caller that holds the window at a point other than genesis.
+func (s byronPBFTState) WithIssuerState(
+	issuer byronconsensus.PBFTState,
+) ByronPBFTState {
+	s.issuerState = issuer
+	return s
+}
+
 // ByronPBFTAdvanceOutcome reports what AdvanceByronPBFTState did beyond
 // returning the new state.
 type ByronPBFTAdvanceOutcome struct {
@@ -701,5 +721,329 @@ func AdvanceByronPBFTState(
 	block lcommon.Block,
 	shouldValidate bool,
 ) (ByronPBFTState, ByronPBFTAdvanceOutcome, error) {
-	return advanceByronPBFTStateCore(config, state, block, shouldValidate, nil)
+	return advanceByronPBFTStateCore(config, state, block, shouldValidate, false, nil)
+}
+
+// ErrStaleChainIterator is the error of a block that does not extend the
+// recorded tip.
+var ErrStaleChainIterator = errStaleChainIterator
+
+// ErrByronChainOpen is the error of an epoch boundary block past epoch 0
+// offered to a chain with no blocks: it follows a block, so it cannot open the
+// chain.
+var ErrByronChainOpen = errors.New(
+	"apply Byron block: an epoch boundary block past epoch 0 cannot open the chain",
+)
+
+// checkBlockPrevHash requires block to extend the tip whose hash is
+// expectedPrevHash. An empty expectedPrevHash means no tip is known and
+// nothing is checked.
+func checkBlockPrevHash(
+	expectedPrevHash []byte,
+	block lcommon.Block,
+) error {
+	if len(expectedPrevHash) == 0 {
+		return nil
+	}
+	if !bytes.Equal(block.PrevHash().Bytes(), expectedPrevHash) {
+		return fmt.Errorf(
+			"%w: block %s (with prev hash %s) does not fit on current chain tip (%x)",
+			errStaleChainIterator,
+			block.Hash().String(),
+			block.PrevHash().String(),
+			expectedPrevHash,
+		)
+	}
+	return nil
+}
+
+// ByronUtxoKey identifies an unspent Byron output.
+type ByronUtxoKey struct {
+	TxId  lcommon.Blake2b256
+	Index uint32
+}
+
+// ByronUtxo is an in-memory Byron UTxO.
+type ByronUtxo map[ByronUtxoKey]lcommon.Utxo
+
+// Add records an unspent output.
+func (u ByronUtxo) Add(
+	txId lcommon.Blake2b256,
+	index uint32,
+	output lcommon.TransactionOutput,
+) {
+	u[ByronUtxoKey{TxId: txId, Index: index}] = lcommon.Utxo{
+		Id:     shelley.ShelleyTransactionInput{TxId: txId, OutputIndex: index},
+		Output: output,
+	}
+}
+
+// ByronChainState is the state a Byron block is applied to: the PBFT window,
+// delegation and update state, the hash of the last applied block (empty
+// before the first) and the UTxO.
+type ByronChainState struct {
+	PBFT     ByronPBFTState
+	PrevHash []byte
+	Utxo     ByronUtxo
+}
+
+// ByronProtocolMagicMismatchError reports a block whose protocol magic is not
+// the configured one (ChainValidationProtocolMagicMismatch).
+type ByronProtocolMagicMismatchError struct {
+	Block    uint32
+	Expected uint32
+}
+
+func (e ByronProtocolMagicMismatchError) Error() string {
+	return fmt.Sprintf(
+		"byron block protocol magic %d does not match configured %d",
+		e.Block,
+		e.Expected,
+	)
+}
+
+// ByronBlockTxError reports the transaction of a block that failed
+// validation (ChainValidationUTxOValidationError).
+type ByronBlockTxError struct {
+	Index int
+	Err   error
+}
+
+func (e *ByronBlockTxError) Error() string {
+	return fmt.Sprintf("byron block transaction %d: %v", e.Index, e.Err)
+}
+
+func (e *ByronBlockTxError) Unwrap() error { return e.Err }
+
+// byronUtxoView is the ledger view the Byron transaction rules read: the
+// UTxO and the protocol magic. The embedded interface is nil, so a rule that
+// reads anything else panics rather than answering silently.
+type byronUtxoView struct {
+	lcommon.LedgerState
+	magic uint32
+	utxo  ByronUtxo
+}
+
+func (v byronUtxoView) UtxoById(in lcommon.TransactionInput) (lcommon.Utxo, error) {
+	u, ok := v.utxo[ByronUtxoKey{TxId: in.Id(), Index: in.Index()}]
+	if !ok {
+		return lcommon.Utxo{}, errors.New("utxo not found")
+	}
+	return u, nil
+}
+
+func (v byronUtxoView) ByronProtocolMagic() (uint32, error) { return v.magic, nil }
+
+// applyByronTransactions validates txs in order against utxo, each seeing the
+// outputs the earlier ones created, and returns the resulting UTxO. utxo is
+// not modified.
+func applyByronTransactions(
+	magic uint32,
+	params *eras.ByronProtocolParameters,
+	utxo ByronUtxo,
+	slot uint64,
+	txs []lcommon.Transaction,
+) (ByronUtxo, error) {
+	next := make(ByronUtxo, len(utxo))
+	maps.Copy(next, utxo)
+	for i, tx := range txs {
+		view := byronUtxoView{magic: magic, utxo: next}
+		if err := eras.ValidateTxByron(tx, slot, view, params); err != nil {
+			return nil, &ByronBlockTxError{Index: i, Err: err}
+		}
+		for _, in := range tx.Inputs() {
+			delete(next, ByronUtxoKey{TxId: in.Id(), Index: in.Index()})
+		}
+		for _, out := range tx.Produced() {
+			next[ByronUtxoKey{TxId: out.Id.Id(), Index: out.Id.Index()}] = out
+		}
+	}
+	return next, nil
+}
+
+// ApplyByronBlock applies one Byron block to state with the checks of the
+// reference's updateChainBlockOrBoundary, in its order: the block's protocol
+// magic, the link to the previous block, the body proofs and the header and
+// block size limits of the parameters adopted for the block's epoch, the
+// delegation certificates, the update payload and the transactions against
+// the UTxO. The reference registers the update payload after the
+// transactions; here a block failing both reports the update failure.
+//
+// validateHeader additionally runs the PBFT header checks and signature
+// window (delegate signature, active delegation, issuer limit), which the
+// reference leaves to its consensus layer. The update state must be
+// initialized, since the adopted parameters bound everything else.
+func ApplyByronBlock(
+	config byronconsensus.ByronConfig,
+	state ByronChainState,
+	block lcommon.Block,
+	validateHeader bool,
+) (ByronChainState, error) {
+	if !state.PBFT.update.Initialized() {
+		return ByronChainState{}, errors.New(
+			"apply Byron block: the update state is not initialized",
+		)
+	}
+	main, isMain := block.(*byron.ByronMainBlock)
+	if isMain {
+		if header, ok := block.Header().(*byron.ByronMainBlockHeader); ok &&
+			header != nil && header.ProtocolMagic != config.ProtocolMagic {
+			return ByronChainState{}, ByronProtocolMagicMismatchError{
+				Block:    header.ProtocolMagic,
+				Expected: config.ProtocolMagic,
+			}
+		}
+	}
+	if header, ok := block.Header().(*byron.ByronEpochBoundaryBlockHeader); ok &&
+		header != nil && len(state.PrevHash) == 0 &&
+		header.ConsensusData.Epoch != 0 {
+		return ByronChainState{}, ErrByronChainOpen
+	}
+	if err := checkBlockPrevHash(state.PrevHash, block); err != nil {
+		return ByronChainState{}, err
+	}
+	flatSlot, err := byronFlatSlot(block, config.SecurityParam)
+	if err != nil {
+		return ByronChainState{}, err
+	}
+	// The limits and the transaction rules read the parameters as ticked to
+	// the block's epoch, before the block's own update payload.
+	ticked := state.PBFT.update.Tick(byronupdate.Config{
+		ProtocolMagic:  config.ProtocolMagic,
+		K:              config.SecurityParam,
+		NumGenesisKeys: config.NumGenesisKeys,
+	}, flatSlot)
+	params := ticked.AdoptedParams()
+	if err := checkByronBlockBody(block, params, nil); err != nil {
+		return ByronChainState{}, err
+	}
+	nextPBFT, _, err := advanceByronPBFTStateCore(
+		config, state.PBFT, block, validateHeader, true, nil,
+	)
+	if err != nil {
+		return ByronChainState{}, err
+	}
+	utxo := state.Utxo
+	if isMain {
+		utxo, err = applyByronTransactions(
+			config.ProtocolMagic, params, utxo, flatSlot, main.Transactions(),
+		)
+		if err != nil {
+			return ByronChainState{}, err
+		}
+	}
+	return ByronChainState{
+		PBFT:     nextPBFT,
+		PrevHash: block.Hash().Bytes(),
+		Utxo:     utxo,
+	}, nil
+}
+
+// Fields a block order check can reject.
+const (
+	BlockOrderFieldNumber = "block number"
+	BlockOrderFieldSlot   = "slot"
+)
+
+// BlockOrder is a block and the parent it extends, after the slots of two
+// Byron blocks have been numbered with the configured epoch length.
+type BlockOrder struct {
+	BlockNumber uint64
+	Slot        uint64
+	// Byron marks a block of the Byron era; ByronEBB an epoch boundary block.
+	Byron    bool
+	ByronEBB bool
+
+	ParentBlockNumber uint64
+	ParentSlot        uint64
+	ParentByronEBB    bool
+}
+
+// BlockOrderError is a block that does not follow its parent. Field is
+// BlockOrderFieldNumber or BlockOrderFieldSlot.
+type BlockOrderError struct {
+	Field string
+	msg   string
+}
+
+func (e *BlockOrderError) Error() string { return e.msg }
+
+// CheckBlockOrder checks that a block follows its parent by block number and
+// slot. Byron's rules are asymmetric around epoch boundary blocks (the
+// expectedNextBlockNo and minimumNextSlotNo tables of the Byron consensus
+// envelope):
+//
+//	parent   block    block number   slot
+//	regular  regular  parent + 1     later
+//	regular  EBB      parent         later
+//	EBB      regular  parent + 1     same or later
+//	EBB      EBB      parent + 1     later
+//
+// A regular block may share an EBB parent's slot only within Byron. The block
+// number is checked before the slot. The error is a *BlockOrderError.
+func CheckBlockOrder(o BlockOrder) error {
+	if err := CheckBlockOrderNumber(o); err != nil {
+		return err
+	}
+	return CheckBlockOrderSlot(o)
+}
+
+// CheckBlockOrderNumber is the block number half of CheckBlockOrder; it reads
+// no slot.
+func CheckBlockOrderNumber(o BlockOrder) error {
+	expectedBlockNumber := o.ParentBlockNumber + 1
+	if o.ByronEBB && !o.ParentByronEBB {
+		expectedBlockNumber = o.ParentBlockNumber
+	}
+	if o.BlockNumber != expectedBlockNumber {
+		if o.ByronEBB {
+			return &BlockOrderError{
+				Field: BlockOrderFieldNumber,
+				msg: fmt.Sprintf(
+					"byron EBB block number %d does not match expected block number %d",
+					o.BlockNumber,
+					expectedBlockNumber,
+				),
+			}
+		}
+		return &BlockOrderError{
+			Field: BlockOrderFieldNumber,
+			msg: fmt.Sprintf(
+				"block number %d does not follow parent block number %d",
+				o.BlockNumber,
+				o.ParentBlockNumber,
+			),
+		}
+	}
+	return nil
+}
+
+// CheckBlockOrderSlot is the slot half of CheckBlockOrder; it reads no block
+// number.
+func CheckBlockOrderSlot(o BlockOrder) error {
+	if !o.ByronEBB && o.ParentByronEBB && o.Byron &&
+		o.Slot == o.ParentSlot {
+		return nil
+	}
+	if o.Slot <= o.ParentSlot {
+		if o.ByronEBB {
+			return &BlockOrderError{
+				Field: BlockOrderFieldSlot,
+				msg: fmt.Sprintf(
+					"byron EBB slot %d does not follow parent slot %d",
+					o.Slot,
+					o.ParentSlot,
+				),
+			}
+		}
+		return &BlockOrderError{
+			Field: BlockOrderFieldSlot,
+			msg: fmt.Sprintf(
+				"block slot %d does not follow parent slot %d",
+				o.Slot,
+				o.ParentSlot,
+			),
+		}
+	}
+	return nil
 }

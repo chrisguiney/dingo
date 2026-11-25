@@ -444,6 +444,16 @@ func (ls *LedgerState) nonMyopicState(
 			hasLikelihood: hasLikelihood,
 		})
 	}
+	if err := rankNonMyopicPools(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// rankNonMyopicPools sets each pool's desirability, orders the pools by it
+// (ties by pool key) and selects the top pools: the first OptimalPoolCount
+// pools that have a likelihood history.
+func rankNonMyopicPools(state *nonMyopicQueryState) error {
 	for i := range state.pools {
 		state.pools[i].desirability = nonMyopicPoolDesirability(state.pools[i], state)
 	}
@@ -457,7 +467,7 @@ func (ls *LedgerState) nonMyopicState(
 		return bytes.Compare(a.key.Bytes(), b.key.Bytes())
 	})
 	if state.params.OptimalPoolCount > math.MaxInt {
-		return nil, errors.New("non-myopic optimal pool count exceeds int range")
+		return errors.New("non-myopic optimal pool count exceeds int range")
 	}
 	//nolint:gosec // bounded by math.MaxInt above
 	limit := int(state.params.OptimalPoolCount)
@@ -472,7 +482,7 @@ func (ls *LedgerState) nonMyopicState(
 		}
 		state.topPools[pool.key] = struct{}{}
 	}
-	return state, nil
+	return nil
 }
 
 func (ls *LedgerState) queryShelleyRewardInfoPools(

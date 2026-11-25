@@ -38,9 +38,13 @@ import (
 	"github.com/blinklabs-io/dingo/ledger/eras"
 	"github.com/blinklabs-io/dingo/ledger/governance"
 	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger/alonzo"
+	"github.com/blinklabs-io/gouroboros/ledger/babbage"
 	"github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/blinklabs-io/gouroboros/ledger/conway"
 	"github.com/blinklabs-io/gouroboros/ledger/dijkstra"
+	"github.com/blinklabs-io/gouroboros/ledger/mary"
+	"github.com/blinklabs-io/gouroboros/ledger/shelley"
 	ochainsync "github.com/blinklabs-io/gouroboros/protocol/chainsync"
 	ocommon "github.com/blinklabs-io/gouroboros/protocol/common"
 	"github.com/blinklabs-io/ouroboros-mock/conformance"
@@ -147,6 +151,13 @@ type DingoStateManager struct {
 	// proposals, keyed by gov action id, consumed at enactment.
 	committeeQuorums map[string]*big.Rat
 	stakeDeposits    map[mockledger.RewardAccountKey]uint64
+
+	// networkID is the ledger's network; zero is testnet. See SetNetworkID.
+	networkID uint
+
+	// seedHook, when set, writes rows the parsed state cannot carry inside
+	// LoadInitialState's import transaction; see SetSeedHook.
+	seedHook func(*dledger.ImportLedgerDB, ledgerdb.Txn) error
 
 	// lastSlot/blockIndex give each transaction within the same slot a
 	// distinct, increasing block index, matching production's
@@ -340,6 +351,12 @@ func (m *DingoStateManager) LoadInitialState(
 			txn,
 		); err != nil {
 			return fmt.Errorf("seed account: %w", err)
+		}
+	}
+
+	if m.seedHook != nil {
+		if err := m.seedHook(m.ldb, txn); err != nil {
+			return fmt.Errorf("seed hook: %w", err)
 		}
 	}
 
@@ -636,6 +653,40 @@ func stateManagerProtocolMajor(
 	return uint64(versioned.ProtocolMajorVersion()), nil
 }
 
+// stateManagerDeposits returns the key and pool deposits of the parameters of
+// any Shelley-family era, and false when pp is none of them.
+func stateManagerDeposits(
+	pp common.ProtocolParameters,
+) (keyDeposit, poolDeposit uint64, ok bool) {
+	switch p := pp.(type) {
+	case *conway.ConwayProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	case *dijkstra.DijkstraProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	case *babbage.BabbageProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	case *alonzo.AlonzoProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	case *mary.MaryProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	case *shelley.ShelleyProtocolParameters:
+		if p != nil {
+			return uint64(p.KeyDeposit), uint64(p.PoolDeposit), true
+		}
+	}
+	return 0, 0, false
+}
+
 func stateManagerConwayProtocolParameters(
 	pp common.ProtocolParameters,
 ) *conway.ConwayProtocolParameters {
@@ -911,11 +962,7 @@ func (m *DingoStateManager) certDepositsFor(
 	certs []common.Certificate,
 ) map[int]uint64 {
 	deposits := make(map[int]uint64, len(certs))
-	var keyDeposit, poolDeposit uint64
-	if conwayPP := stateManagerConwayProtocolParameters(m.protocolParams); conwayPP != nil {
-		keyDeposit = uint64(conwayPP.KeyDeposit)
-		poolDeposit = uint64(conwayPP.PoolDeposit)
-	}
+	keyDeposit, poolDeposit, _ := stateManagerDeposits(m.protocolParams)
 	for i, cert := range certs {
 		switch c := cert.(type) {
 		case *common.StakeRegistrationCertificate:
@@ -949,11 +996,11 @@ func (m *DingoStateManager) initialStakeDepositLocked() *types.Uint64 {
 	// ledger/eras uses before dereferencing era parameters. Reporting nil
 	// here is the correct answer anyway: with no usable parameters the
 	// deposit is unknown.
-	conwayPP := stateManagerConwayProtocolParameters(m.protocolParams)
-	if conwayPP == nil {
+	keyDeposit, _, ok := stateManagerDeposits(m.protocolParams)
+	if !ok {
 		return nil
 	}
-	deposit := types.Uint64(conwayPP.KeyDeposit)
+	deposit := types.Uint64(keyDeposit)
 	return &deposit
 }
 
@@ -1343,9 +1390,7 @@ func (m *DingoStateManager) updateStakeDepositForCertificate(
 	switch c := cert.(type) {
 	case *common.StakeRegistrationCertificate:
 		credential, registered = c.StakeCredential, true
-		if pp := stateManagerConwayProtocolParameters(m.protocolParams); pp != nil {
-			deposit = uint64(pp.KeyDeposit)
-		}
+		deposit, _, _ = stateManagerDeposits(m.protocolParams)
 	case *common.RegistrationCertificate:
 		credential, deposit, registered = c.StakeCredential, c.Amount, true
 	case *common.StakeRegistrationDelegationCertificate:

@@ -624,6 +624,7 @@ func (ls *LedgerState) advanceByronPBFTState(
 		state,
 		block,
 		shouldValidate,
+		false,
 		func() error { return ls.validateByronPBFTHeaderCrypto(ctx, block) },
 	)
 	if err != nil {
@@ -639,11 +640,50 @@ func (ls *LedgerState) advanceByronPBFTState(
 	return next, nil
 }
 
+// ByronDelegationPayloadError is a failure to apply a main block's delegation
+// certificates (the reference's ChainValidationDelegationSchedulingError).
+type ByronDelegationPayloadError struct {
+	Slot uint64
+	Err  error
+}
+
+func (e ByronDelegationPayloadError) Error() string {
+	return fmt.Sprintf(
+		"apply Byron PBFT delegation payload at slot %d: %v",
+		e.Slot,
+		e.Err,
+	)
+}
+
+func (e ByronDelegationPayloadError) Unwrap() error { return e.Err }
+
+// ByronUpdatePayloadError is a failure to register a main block's update
+// payload (the reference's ChainValidationUpdateError).
+type ByronUpdatePayloadError struct {
+	Slot uint64
+	Err  error
+}
+
+func (e ByronUpdatePayloadError) Error() string {
+	return fmt.Sprintf(
+		"apply Byron update payload at slot %d: %v",
+		e.Slot,
+		e.Err,
+	)
+}
+
+func (e ByronUpdatePayloadError) Unwrap() error { return e.Err }
+
+// advanceByronPBFTStateCore advances state over block. shouldValidate runs the
+// header and PBFT window checks and, on a state that holds the whole update
+// history, makes an update payload failure fatal. strictUpdate makes it fatal
+// on any state, for a caller whose state is complete by construction.
 func advanceByronPBFTStateCore(
 	config byronconsensus.ByronConfig,
 	state byronPBFTState,
 	block ledger.Block,
 	shouldValidate bool,
+	strictUpdate bool,
 	headerCrypto func() error,
 ) (byronPBFTState, ByronPBFTAdvanceOutcome, error) {
 	var outcome ByronPBFTAdvanceOutcome
@@ -683,8 +723,9 @@ func advanceByronPBFTStateCore(
 			return byronPBFTState{}, outcome, err
 		}
 		if block.Type() != ledgerbyron.BlockTypeByronEbb {
-			state.issuerState, err = state.issuerState.Transition(
+			state.issuerState, err = state.issuerState.TransitionAt(
 				issuer.GenesisKeyHash,
+				flatSlot,
 			)
 			if err != nil {
 				return byronPBFTState{}, outcome, err
@@ -714,8 +755,9 @@ func advanceByronPBFTStateCore(
 				err,
 			)
 		}
-		state.issuerState, err = state.issuerState.Observe(
+		state.issuerState, err = state.issuerState.ObserveAt(
 			issuer.GenesisKeyHash,
+			flatSlot,
 		)
 		if err != nil {
 			return byronPBFTState{}, outcome, err
@@ -737,11 +779,10 @@ func advanceByronPBFTStateCore(
 	}
 	dlgPayload, err := byronDelegationPayload(mainBlock)
 	if err != nil {
-		return byronPBFTState{}, outcome, fmt.Errorf(
-			"apply Byron PBFT delegation payload at slot %d: %w",
-			block.SlotNumber(),
-			err,
-		)
+		return byronPBFTState{}, outcome, ByronDelegationPayloadError{
+			Slot: block.SlotNumber(),
+			Err:  err,
+		}
 	}
 	state.delegationState, err = state.delegationState.ApplyPayloadCbor(
 		epoch,
@@ -749,11 +790,10 @@ func advanceByronPBFTStateCore(
 		dlgPayload,
 	)
 	if err != nil {
-		return byronPBFTState{}, outcome, fmt.Errorf(
-			"apply Byron PBFT delegation payload at slot %d: %w",
-			block.SlotNumber(),
-			err,
-		)
+		return byronPBFTState{}, outcome, ByronDelegationPayloadError{
+			Slot: block.SlotNumber(),
+			Err:  err,
+		}
 	}
 	if !state.update.Initialized() {
 		return state, outcome, nil
@@ -772,12 +812,11 @@ func advanceByronPBFTStateCore(
 		// Only a state built from the first block knows every registered
 		// proposal; a partial one would reject valid votes for proposals
 		// registered before its trusted start.
-		if shouldValidate && state.update.Complete() {
-			return byronPBFTState{}, outcome, fmt.Errorf(
-				"apply Byron update payload at slot %d: %w",
-				block.SlotNumber(),
-				err,
-			)
+		if strictUpdate || (shouldValidate && state.update.Complete()) {
+			return byronPBFTState{}, outcome, ByronUpdatePayloadError{
+				Slot: block.SlotNumber(),
+				Err:  err,
+			}
 		}
 		// A trusted block was accepted by the network, and a partial state
 		// cannot judge one, so keep following the chain and record the

@@ -549,9 +549,26 @@ func parseCurrentEra(
 		return nil, fmt.Errorf("parsing tip: %w", err)
 	}
 
+	result, err := ParseNewEpochState(eraIndex, shelleyState[1])
+	if err != nil {
+		return nil, err
+	}
+	result.Tip = tip
+	result.EraBoundSlot = eraBoundSlot
+	result.EraBoundEpoch = eraBoundEpoch
+	return result, nil
+}
+
+// ParseNewEpochState decodes a NewEpochState, the payload of a ledger
+// snapshot's current era after the telescope and tip are peeled off. The
+// result carries no Tip or era bound.
+func ParseNewEpochState(
+	eraIndex int,
+	data cbor.RawMessage,
+) (*RawLedgerState, error) {
 	// NewEpochState = [epoch, blocks-prev, blocks-cur, EpochState,
 	//                  reward-update, pool-distr, stashed]
-	nes, err := decodeRawArray(shelleyState[1])
+	nes, err := decodeRawArray(data)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"decoding NewEpochState: %w",
@@ -684,13 +701,10 @@ func parseCurrentEra(
 	result := &RawLedgerState{
 		EraIndex:      eraIndex,
 		Epoch:         epoch,
-		Tip:           tip,
 		Treasury:      treasury,
 		Reserves:      reserves,
 		Fees:          fees,
 		Donation:      donation,
-		EraBoundSlot:  eraBoundSlot,
-		EraBoundEpoch: eraBoundEpoch,
 		UTxOData:      utxoState[0], // The UTxO map
 		CertStateData: ls[0],        // [VState, PState, DState]
 		SnapShotsData: es[2],        // mark/set/go

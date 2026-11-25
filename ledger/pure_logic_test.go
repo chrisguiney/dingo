@@ -379,3 +379,82 @@ func TestCandidateFreezeCutoff(t *testing.T) {
 	require.Equal(t, uint64(500_000), CandidateFreezeCutoff(500_000, 501_000, 5_000))
 	require.Equal(t, uint64(2_000), CandidateFreezeCutoff(0, 2_000, 0))
 }
+
+func TestCheckBlockOrder(t *testing.T) {
+	t.Parallel()
+	regular := BlockOrder{BlockNumber: 11, Slot: 101, ParentBlockNumber: 10, ParentSlot: 100}
+	for name, tc := range map[string]struct {
+		mutate  func(*BlockOrder)
+		field   string
+		message string
+	}{
+		"regular after regular": {mutate: func(*BlockOrder) {}},
+		"block number repeats the parent's": {
+			mutate:  func(o *BlockOrder) { o.BlockNumber = 10 },
+			field:   BlockOrderFieldNumber,
+			message: "block number 10 does not follow parent block number 10",
+		},
+		"block number skips one": {
+			mutate:  func(o *BlockOrder) { o.BlockNumber = 12 },
+			field:   BlockOrderFieldNumber,
+			message: "block number 12 does not follow parent block number 10",
+		},
+		"slot equals the parent's": {
+			mutate:  func(o *BlockOrder) { o.Slot = 100 },
+			field:   BlockOrderFieldSlot,
+			message: "block slot 100 does not follow parent slot 100",
+		},
+		"slot before the parent's": {
+			mutate:  func(o *BlockOrder) { o.Slot = 99 },
+			field:   BlockOrderFieldSlot,
+			message: "block slot 99 does not follow parent slot 100",
+		},
+		"block number is checked before the slot": {
+			mutate:  func(o *BlockOrder) { o.BlockNumber, o.Slot = 12, 99 },
+			field:   BlockOrderFieldNumber,
+			message: "block number 12 does not follow parent block number 10",
+		},
+		"Byron EBB keeps the parent's number": {
+			mutate: func(o *BlockOrder) { o.Byron, o.ByronEBB, o.BlockNumber = true, true, 10 },
+		},
+		"Byron EBB with the next number": {
+			mutate:  func(o *BlockOrder) { o.Byron, o.ByronEBB = true, true },
+			field:   BlockOrderFieldNumber,
+			message: "byron EBB block number 11 does not match expected block number 10",
+		},
+		"Byron EBB at its parent's slot": {
+			mutate:  func(o *BlockOrder) { o.Byron, o.ByronEBB, o.BlockNumber, o.Slot = true, true, 10, 100 },
+			field:   BlockOrderFieldSlot,
+			message: "byron EBB slot 100 does not follow parent slot 100",
+		},
+		"regular after a Byron EBB may share its slot": {
+			mutate: func(o *BlockOrder) { o.Byron, o.ParentByronEBB, o.Slot = true, true, 100 },
+		},
+		"regular after a Byron EBB in a later slot": {
+			mutate: func(o *BlockOrder) { o.Byron, o.ParentByronEBB = true, true },
+		},
+		"the shared slot is a Byron privilege": {
+			mutate:  func(o *BlockOrder) { o.ParentByronEBB, o.Slot = true, 100 },
+			field:   BlockOrderFieldSlot,
+			message: "block slot 100 does not follow parent slot 100",
+		},
+		"EBB after an EBB takes the next number": {
+			mutate: func(o *BlockOrder) { o.Byron, o.ByronEBB, o.ParentByronEBB = true, true, true },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			o := regular
+			tc.mutate(&o)
+			err := CheckBlockOrder(o)
+			if tc.field == "" {
+				require.NoError(t, err)
+				return
+			}
+			var oe *BlockOrderError
+			require.ErrorAs(t, err, &oe)
+			assert.Equal(t, tc.field, oe.Field)
+			assert.EqualError(t, err, tc.message)
+		})
+	}
+}

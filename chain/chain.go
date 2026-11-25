@@ -727,7 +727,7 @@ func (c *Chain) addBlockHeader(
 	if c.tipBlockIndex >= initialBlockIndex ||
 		len(c.headers) > 0 {
 		headerTip := c.headerTip()
-		if !bytes.Equal(queued.prevHash, headerTip.Point.Hash) {
+		if !FitsTip(queued.prevHash, headerTip.Point.Hash) {
 			return NewBlockNotFitChainTipError(
 				headerHash.String(),
 				headerPrevHash.String(),
@@ -1343,7 +1343,7 @@ func (c *Chain) addBlockLocked(
 	}
 	// Check that this block fits on the current chain tip
 	if c.tipBlockIndex >= initialBlockIndex {
-		if !bytes.Equal(blockPrevHashBytes, c.currentTip.Point.Hash) {
+		if !FitsTip(blockPrevHashBytes, c.currentTip.Point.Hash) {
 			return event.Event{}, NewBlockNotFitChainTipError(
 				hex.EncodeToString(blockHashBytes),
 				hex.EncodeToString(blockPrevHashBytes),
