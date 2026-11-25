@@ -154,41 +154,6 @@ func (ls *LedgerState) byronPBFTGenesis() (
 	return cache.config, cache.noGenesisIssuers, nil
 }
 
-func (ls *LedgerState) validateByronPBFTHeader(
-	ctx context.Context,
-	block ledger.Block,
-	delegationState byronconsensus.PBFTDelegationState,
-) (byronconsensus.PBFTIssuer, error) {
-	if err := ls.validateByronPBFTHeaderCrypto(ctx, block); err != nil {
-		return byronconsensus.PBFTIssuer{}, err
-	}
-	if block.Type() == ledgerbyron.BlockTypeByronEbb {
-		return byronconsensus.PBFTIssuer{}, nil
-	}
-	header, ok := block.Header().(*ledgerbyron.ByronMainBlockHeader)
-	if !ok || header == nil {
-		return byronconsensus.PBFTIssuer{}, fmt.Errorf(
-			"byron main block at slot %d has unexpected header type %T",
-			block.SlotNumber(),
-			block.Header(),
-		)
-	}
-	config, err := ls.byronPBFTConfig()
-	if err != nil {
-		return byronconsensus.PBFTIssuer{}, err
-	}
-	config.GenesisDelegations = delegationState.ActiveDelegations()
-	issuer, err := byronconsensus.ValidatePBFTHeader(header, config)
-	if err != nil {
-		return byronconsensus.PBFTIssuer{}, fmt.Errorf(
-			"byron PBFT header verification failed at slot %d: %w",
-			block.SlotNumber(),
-			err,
-		)
-	}
-	return issuer, nil
-}
-
 func (ls *LedgerState) validateByronPBFTHeaderCrypto(
 	ctx context.Context,
 	block ledger.Block,
@@ -650,17 +615,45 @@ func (ls *LedgerState) advanceByronPBFTState(
 	block ledger.Block,
 	shouldValidate bool,
 ) (byronPBFTState, error) {
-	epoch, err := byronBlockEpoch(block)
-	if err != nil {
-		return byronPBFTState{}, err
-	}
 	config, err := ls.byronPBFTConfig()
 	if err != nil {
 		return byronPBFTState{}, err
 	}
-	flatSlot, err := byronFlatSlot(block, config.SecurityParam)
+	next, outcome, err := advanceByronPBFTStateCore(
+		config,
+		state,
+		block,
+		shouldValidate,
+		func() error { return ls.validateByronPBFTHeaderCrypto(ctx, block) },
+	)
 	if err != nil {
 		return byronPBFTState{}, err
+	}
+	if outcome.SkippedUpdateErr != nil && ls.config.Logger != nil {
+		ls.config.Logger.Warn(
+			"skipping Byron update payload of trusted block",
+			"slot", block.SlotNumber(),
+			"error", outcome.SkippedUpdateErr,
+		)
+	}
+	return next, nil
+}
+
+func advanceByronPBFTStateCore(
+	config byronconsensus.ByronConfig,
+	state byronPBFTState,
+	block ledger.Block,
+	shouldValidate bool,
+	headerCrypto func() error,
+) (byronPBFTState, ByronPBFTAdvanceOutcome, error) {
+	var outcome ByronPBFTAdvanceOutcome
+	epoch, err := byronBlockEpoch(block)
+	if err != nil {
+		return byronPBFTState{}, outcome, err
+	}
+	flatSlot, err := byronFlatSlot(block, config.SecurityParam)
+	if err != nil {
+		return byronPBFTState{}, outcome, err
 	}
 	state.delegationState = state.delegationState.Tick(
 		epoch,
@@ -676,20 +669,25 @@ func (ls *LedgerState) advanceByronPBFTState(
 		state.update = state.update.Tick(updateConfig, flatSlot)
 	}
 	if shouldValidate {
-		issuer, err := ls.validateByronPBFTHeader(
-			ctx,
+		if headerCrypto != nil {
+			if err := headerCrypto(); err != nil {
+				return byronPBFTState{}, outcome, err
+			}
+		}
+		issuer, err := ValidateByronPBFTIssuer(
 			block,
+			config,
 			state.delegationState,
 		)
 		if err != nil {
-			return byronPBFTState{}, err
+			return byronPBFTState{}, outcome, err
 		}
 		if block.Type() != ledgerbyron.BlockTypeByronEbb {
 			state.issuerState, err = state.issuerState.Transition(
 				issuer.GenesisKeyHash,
 			)
 			if err != nil {
-				return byronPBFTState{}, err
+				return byronPBFTState{}, outcome, err
 			}
 		}
 	}
@@ -697,11 +695,11 @@ func (ls *LedgerState) advanceByronPBFTState(
 		if state.update.Initialized() {
 			state.update = state.update.Advance(flatSlot, block.BlockNumber())
 		}
-		return state, nil
+		return state, outcome, nil
 	}
 	header, ok := block.Header().(*ledgerbyron.ByronMainBlockHeader)
 	if !ok || header == nil {
-		return byronPBFTState{}, fmt.Errorf(
+		return byronPBFTState{}, outcome, fmt.Errorf(
 			"advance Byron PBFT state: block at slot %d has header type %T",
 			block.SlotNumber(),
 			block.Header(),
@@ -710,7 +708,7 @@ func (ls *LedgerState) advanceByronPBFTState(
 	if !shouldValidate {
 		issuer, err := byronconsensus.PBFTIssuerFromHeader(header)
 		if err != nil {
-			return byronPBFTState{}, fmt.Errorf(
+			return byronPBFTState{}, outcome, fmt.Errorf(
 				"observe trusted Byron PBFT header at slot %d: %w",
 				block.SlotNumber(),
 				err,
@@ -720,12 +718,12 @@ func (ls *LedgerState) advanceByronPBFTState(
 			issuer.GenesisKeyHash,
 		)
 		if err != nil {
-			return byronPBFTState{}, err
+			return byronPBFTState{}, outcome, err
 		}
 	}
 	mainBlock, ok := block.(*ledgerbyron.ByronMainBlock)
 	if !ok || mainBlock == nil {
-		return byronPBFTState{}, fmt.Errorf(
+		return byronPBFTState{}, outcome, fmt.Errorf(
 			"advance Byron PBFT delegation state: block at slot %d has type %T",
 			block.SlotNumber(),
 			block,
@@ -739,7 +737,7 @@ func (ls *LedgerState) advanceByronPBFTState(
 	}
 	dlgPayload, err := byronDelegationPayload(mainBlock)
 	if err != nil {
-		return byronPBFTState{}, fmt.Errorf(
+		return byronPBFTState{}, outcome, fmt.Errorf(
 			"apply Byron PBFT delegation payload at slot %d: %w",
 			block.SlotNumber(),
 			err,
@@ -751,14 +749,14 @@ func (ls *LedgerState) advanceByronPBFTState(
 		dlgPayload,
 	)
 	if err != nil {
-		return byronPBFTState{}, fmt.Errorf(
+		return byronPBFTState{}, outcome, fmt.Errorf(
 			"apply Byron PBFT delegation payload at slot %d: %w",
 			block.SlotNumber(),
 			err,
 		)
 	}
 	if !state.update.Initialized() {
-		return state, nil
+		return state, outcome, nil
 	}
 	nextUpdate, err := applyByronUpdatePayload(
 		state.update,
@@ -775,7 +773,7 @@ func (ls *LedgerState) advanceByronPBFTState(
 		// proposal; a partial one would reject valid votes for proposals
 		// registered before its trusted start.
 		if shouldValidate && state.update.Complete() {
-			return byronPBFTState{}, fmt.Errorf(
+			return byronPBFTState{}, outcome, fmt.Errorf(
 				"apply Byron update payload at slot %d: %w",
 				block.SlotNumber(),
 				err,
@@ -784,17 +782,11 @@ func (ls *LedgerState) advanceByronPBFTState(
 		// A trusted block was accepted by the network, and a partial state
 		// cannot judge one, so keep following the chain and record the
 		// disagreement rather than refusing it.
-		if ls.config.Logger != nil {
-			ls.config.Logger.Warn(
-				"skipping Byron update payload of trusted block",
-				"slot", block.SlotNumber(),
-				"error", err,
-			)
-		}
+		outcome.SkippedUpdateErr = err
 		nextUpdate = state.update.Advance(flatSlot, block.BlockNumber())
 	}
 	state.update = nextUpdate
-	return state, nil
+	return state, outcome, nil
 }
 
 // applyByronUpdatePayload registers a main block's update proposal, votes

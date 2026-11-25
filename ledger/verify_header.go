@@ -2154,26 +2154,9 @@ func classifyGenesisOverlaySlot(
 	activeSlotsCoeff *big.Rat,
 	genesisKeyCount uint64,
 ) (uint64, genesisOverlaySlotStatus) {
-	if decentralization == nil ||
-		decentralization.Sign() <= 0 ||
-		decentralization.Cmp(big.NewRat(1, 1)) > 0 ||
-		activeSlotsCoeff == nil ||
-		activeSlotsCoeff.Sign() <= 0 ||
-		activeSlotsCoeff.Cmp(big.NewRat(1, 1)) > 0 ||
-		genesisKeyCount == 0 {
-		return 0, genesisOverlayNone
-	}
-	position := ceilUint64Rat(relativeSlot, decentralization)
-	nextPosition := ceilUint64Rat(relativeSlot+1, decentralization)
-	if position >= nextPosition {
-		return 0, genesisOverlayNone
-	}
-	activeSlotCoeffInv := activeSlotCoeffInverse(activeSlotsCoeff)
-	if activeSlotCoeffInv == 0 || position%activeSlotCoeffInv != 0 {
-		return 0, genesisOverlayNonActive
-	}
-	return (position / activeSlotCoeffInv) % genesisKeyCount,
-		genesisOverlayActive
+	return ClassifyGenesisOverlaySlot(
+		relativeSlot, decentralization, activeSlotsCoeff, genesisKeyCount,
+	)
 }
 
 func ceilUint64Rat(v uint64, rat *big.Rat) uint64 {
@@ -3426,19 +3409,12 @@ func (ls *LedgerState) verifyRegisteredVrfKeyFromSnapshot(
 			poolKeyHash[:],
 		)
 	}
-	headerVrfKeyHash := lcommon.Blake2b256Hash(vrfKey)
-	if !bytes.Equal(registeredVrfKeyHash.Bytes(), headerVrfKeyHash.Bytes()) {
-		return fmt.Errorf(
-			"block header verification rejected at slot %d: "+
-				"producer pool %x VRF key does not match registered VRF key "+
-				"(header %x, registered %x)",
-			block.SlotNumber(),
-			poolKeyHash[:],
-			headerVrfKeyHash.Bytes(),
-			registeredVrfKeyHash.Bytes(),
-		)
-	}
-	return nil
+	return CheckRegisteredVrfKey(
+		block.SlotNumber(),
+		poolKeyHash[:],
+		vrfKey,
+		registeredVrfKeyHash.Bytes(),
+	)
 }
 
 // registeredPoolVrfKeyHash resolves the VRF key hash a pool is currently
