@@ -16,12 +16,14 @@ package governance
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"sort"
 
+	"github.com/blinklabs-io/dingo/database/ledgerdb"
 	"github.com/blinklabs-io/dingo/database/models"
 	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/blinklabs-io/gouroboros/ledger/conway"
@@ -695,4 +697,16 @@ func PlanCommitteeUpdate(
 	})
 	plan.Add = members
 	return plan, nil
+}
+
+// LoadDRepStakeDistribution reads the complete boundary DRep stake
+// distribution for activeProposalEpoch through db and txn, exactly as the epoch
+// boundary does.
+func LoadDRepStakeDistribution(
+	ctx context.Context,
+	db ledgerdb.LedgerDB,
+	txn ledgerdb.Txn,
+	activeProposalEpoch uint64,
+) ([]models.DRepStakeDistributionEntry, error) {
+	return loadDRepStakeDistribution(ctx, db, txn, activeProposalEpoch)
 }
