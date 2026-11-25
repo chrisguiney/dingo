@@ -92,6 +92,11 @@ type NewEpochInput struct {
 	// Rewards is the pending reward update, nil when there is none. When set
 	// its stake rows replace PriorGo.
 	Rewards *NewEpochRewards
+	// Gov is the governance state the boundary reads, nil for none. It is
+	// the state RATIFY decided over at the boundary before: that decision is
+	// made by the production RATIFY on a database of its own, and the
+	// boundary under test enacts and drops what it ratified and expired.
+	Gov *GovState
 }
 
 // NewEpochOutput is what the boundary left behind.
@@ -101,6 +106,8 @@ type NewEpochOutput struct {
 	PoolsRemoved       [][]byte
 	Reserves, Treasury uint64
 	Mark, Set, Go      []SnapshotStake
+	// Gov is set when the input held governance state.
+	Gov *NewEpochGovOutput
 }
 
 // NewEpoch builds a scratch ledger at the end of in.Epoch, runs the
@@ -142,7 +149,13 @@ func NewEpoch(ctx context.Context, in NewEpochInput) (out NewEpochOutput, err er
 	if err != nil {
 		return out, fmt.Errorf("dxoracle: %w", err)
 	}
-	if err := seedNewEpoch(sl, set, epoch, in); err != nil {
+	var prior *PriorBoundary
+	if in.Gov != nil {
+		if prior, err = priorBoundary(ctx, *in.Gov, in.Epoch); err != nil {
+			return out, fmt.Errorf("dxoracle: prior boundary: %w", err)
+		}
+	}
+	if err := seedNewEpoch(sl, set, epoch, in, prior); err != nil {
 		return out, err
 	}
 	mgr := snapshot.NewManager(sl.LedgerState().LedgerDB(), event.NewEventBus(nil, nil), nil)
@@ -182,11 +195,17 @@ func NewEpoch(ctx context.Context, in NewEpochInput) (out NewEpochOutput, err er
 		return out, fmt.Errorf("dxoracle: rollover: %w", err)
 	}
 	out.Epoch = result.NewCurrentEpoch.EpochId
-	return readNewEpoch(ctx, ls, in, before, out)
+	out, err = readNewEpoch(ctx, ls, in, before, out)
+	if err != nil || in.Gov == nil {
+		return out, err
+	}
+	out.Gov, err = readNewEpochGov(ctx, ls.LedgerDB(), *in.Gov, prior, out.Epoch)
+	return out, err
 }
 
 func seedNewEpoch(
 	sl *ledger.ScratchLedger, set ledger.UtxoSetWriter, epoch models.Epoch, in NewEpochInput,
+	prior *PriorBoundary,
 ) error {
 	db := sl.Seed()
 	if err := db.SetNetworkState(in.Treasury, in.Reserves, epoch.StartSlot, nil); err != nil {
@@ -270,6 +289,9 @@ func seedNewEpoch(
 		if err := seedPendingRewards(sl, db, epoch, in); err != nil {
 			return err
 		}
+	}
+	if in.Gov != nil {
+		govChanges(&changes, *in.Gov, prior)
 	}
 	sl.SeedChanges(changes)
 	for i, s := range in.Stake {

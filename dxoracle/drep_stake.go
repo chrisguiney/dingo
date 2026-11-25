@@ -195,13 +195,7 @@ func (o *Oracle) seedDRepStake(
 		}
 	}
 	for _, d := range in.Dreps {
-		drep := &models.Drep{
-			CredentialTag: d.Tag,
-			Credential:    d.Key,
-			ExpiryEpoch:   d.ExpiryEpoch,
-			Active:        d.Active,
-		}
-		if err := o.db.CreateDrep(ctx, txn, drep); err != nil {
+		if err := o.db.CreateDrep(ctx, txn, drepRow(d)); err != nil {
 			return fmt.Errorf("seed drep: %w", err)
 		}
 	}

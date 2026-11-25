@@ -162,19 +162,34 @@ func (o *Oracle) seedGov(
 		if v.Proposal < 0 || v.Proposal >= len(rows) {
 			return fmt.Errorf("vote on proposal %d of %d", v.Proposal, len(rows))
 		}
-		vote := &models.GovernanceVote{
-			ProposalID:         rows[v.Proposal].ID,
-			VoterType:          v.Role,
-			VoterCredentialTag: v.Tag,
-			VoterCredential:    v.Key,
-			Vote:               v.Vote,
-			AddedSlot:          seedSlot,
-		}
+		vote := voteRow(v, rows[v.Proposal].ID)
 		if err := o.db.SetGovernanceVote(ctx, vote, txn); err != nil {
 			return fmt.Errorf("seed vote: %w", err)
 		}
 	}
 	return nil
+}
+
+// voteRow is the row for v on the proposal row with id proposalID.
+func voteRow(v GovVote, proposalID uint) *models.GovernanceVote {
+	return &models.GovernanceVote{
+		ProposalID:         proposalID,
+		VoterType:          v.Role,
+		VoterCredentialTag: v.Tag,
+		VoterCredential:    v.Key,
+		Vote:               v.Vote,
+		AddedSlot:          seedSlot,
+	}
+}
+
+// drepRow is the row for a registered DRep.
+func drepRow(d DRep) *models.Drep {
+	return &models.Drep{
+		CredentialTag: d.Tag,
+		Credential:    d.Key,
+		ExpiryEpoch:   d.ExpiryEpoch,
+		Active:        d.Active,
+	}
 }
 
 func proposalRow(p GovProposal, order uint32) *models.GovernanceProposal {

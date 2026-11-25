@@ -16,12 +16,14 @@ package dxoracle_test
 
 import (
 	"context"
+	"encoding/hex"
 	"math/big"
 	"testing"
 
 	"github.com/blinklabs-io/dingo/database/models"
 	"github.com/blinklabs-io/dingo/database/types"
 	"github.com/blinklabs-io/dingo/dxoracle"
+	"github.com/blinklabs-io/dingo/ledger/governance"
 	"github.com/blinklabs-io/gouroboros/cbor"
 	"github.com/blinklabs-io/gouroboros/ledger/conway"
 	"github.com/stretchr/testify/require"
@@ -160,4 +162,85 @@ func TestNewEpochKeepsDRepDelegation(t *testing.T) {
 	for i, d := range delegations {
 		require.Equal(t, d, got.Accounts[i+1].Drep, "account %d", i)
 	}
+}
+
+// The boundary enacts what the boundary before it ratified. One treasury
+// withdrawal is accepted by the DRep and committee votes and pays 1_000_000
+// to a registered account at the next boundary; a second proposal has expired
+// and its deposit goes back to its registered return account, together with
+// the proposal it carries as a child.
+func TestNewEpochEnactsRatifiedAndDropsExpired(t *testing.T) {
+	t.Parallel()
+	pp := conwayPParams()
+	pp.MinCommitteeSize = 1
+	pp.DRepVotingThresholds.TreasuryWithdrawal = unit(1, 2)
+	withdrawal := mustHex("8302a1581de0" + hex.EncodeToString(key(1)) + "1a000f4240f6")
+	gov := dxoracle.GovState{
+		PParams:  pp,
+		Treasury: 5_000_000,
+		Accounts: []dxoracle.Account{
+			{Tag: 0, Key: key(1), Reward: 7, Active: true},
+			{Tag: 0, Key: key(2), Reward: 11, Active: true},
+		},
+		Dreps:     []dxoracle.DRep{{Tag: 0, Key: key(0xd1), ExpiryEpoch: 30, Active: true}},
+		DRepStake: []dxoracle.GovDRepStake{{Delegation: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}, Stake: 100}},
+		Committee: []dxoracle.CommitteeMember{{Tag: 0, Key: key(0xc1), Expiry: 40, Hot: &dxoracle.Credential{Tag: 0, Key: key(0xc2)}}},
+		Quorum:    big.NewRat(1, 1),
+		SPO:       &governance.SPOVotingState{Dist: []*models.PoolStakeSnapshot{{PoolKeyHash: key(0xa0), TotalStake: 100}}, TotalStake: 100},
+		Proposals: []dxoracle.GovProposal{
+			proposal(1, withdrawal, 2, nil, 15, 1000, 0xa2),
+			proposal(2, mustHex(infoAction), 6, nil, 5, 300, 0x02),
+		},
+		Votes: []dxoracle.GovVote{
+			{Proposal: 0, Role: 1, Tag: 0, Key: key(0xd1), Vote: 1},
+			{Proposal: 0, Role: 0, Tag: 0, Key: key(0xc2), Vote: 1},
+		},
+	}
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: pp, Reserves: 10_000_000_000, Treasury: 5_000_000,
+		Accounts: []dxoracle.NewEpochAccount{{Key: key(1), Reward: 7}, {Key: key(2), Reward: 11}},
+		Gov:      &gov,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got.Gov)
+	require.Equal(t, []dxoracle.GovAction{action(1)}, got.Gov.Enacted)
+	require.Equal(t, []dxoracle.GovAction{action(2)}, got.Gov.Expired)
+	require.Equal(t, []dxoracle.GovAction{action(1), action(2)}, got.Gov.Removed)
+	// 5_000_000 less the withdrawal, plus the 1000 deposit whose return
+	// account is not registered.
+	require.Equal(t, uint64(4_001_000), got.Treasury)
+	require.Equal(t, uint64(7+1_000_000), got.Accounts[0].Reward)
+	require.Equal(t, uint64(11+300), got.Accounts[1].Reward)
+}
+
+// Without the committee's vote the withdrawal is not ratified, so nothing is
+// enacted and only the expired proposal leaves.
+func TestNewEpochGovUnratifiedWithdrawalStays(t *testing.T) {
+	t.Parallel()
+	pp := conwayPParams()
+	pp.MinCommitteeSize = 1
+	pp.DRepVotingThresholds.TreasuryWithdrawal = unit(1, 2)
+	withdrawal := mustHex("8302a1581de0" + hex.EncodeToString(key(1)) + "1a000f4240f6")
+	gov := dxoracle.GovState{
+		PParams:   pp,
+		Treasury:  5_000_000,
+		Accounts:  []dxoracle.Account{{Tag: 0, Key: key(1), Reward: 7, Active: true}},
+		Dreps:     []dxoracle.DRep{{Tag: 0, Key: key(0xd1), ExpiryEpoch: 30, Active: true}},
+		DRepStake: []dxoracle.GovDRepStake{{Delegation: dxoracle.Delegation{Type: dxoracle.DelegateKeyHash, Key: key(0xd1)}, Stake: 100}},
+		Committee: []dxoracle.CommitteeMember{{Tag: 0, Key: key(0xc1), Expiry: 40, Hot: &dxoracle.Credential{Tag: 0, Key: key(0xc2)}}},
+		Quorum:    big.NewRat(1, 1),
+		SPO:       &governance.SPOVotingState{Dist: []*models.PoolStakeSnapshot{{PoolKeyHash: key(0xa0), TotalStake: 100}}, TotalStake: 100},
+		Proposals: []dxoracle.GovProposal{proposal(1, withdrawal, 2, nil, 15, 1000, 0xa2)},
+		Votes:     []dxoracle.GovVote{{Proposal: 0, Role: 1, Tag: 0, Key: key(0xd1), Vote: 1}},
+	}
+	got, err := dxoracle.NewEpoch(context.Background(), dxoracle.NewEpochInput{
+		Epoch: 10, PParams: pp, Reserves: 10_000_000_000, Treasury: 5_000_000,
+		Accounts: []dxoracle.NewEpochAccount{{Key: key(1), Reward: 7}},
+		Gov:      &gov,
+	})
+	require.NoError(t, err)
+	require.Empty(t, got.Gov.Enacted)
+	require.Empty(t, got.Gov.Removed)
+	require.Equal(t, uint64(5_000_000), got.Treasury)
+	require.Equal(t, uint64(7), got.Accounts[0].Reward)
 }
