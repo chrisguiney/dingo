@@ -2838,74 +2838,31 @@ func deriveStakeRewardApplicationTotals(app *StakeRewardApplication) error {
 	if app.TotalsFinal {
 		return nil
 	}
-	totalRewardPot := app.TotalRewardPot
-	fees := uint64(app.Pots.Fees)
-	if totalRewardPot < fees {
-		return fmt.Errorf(
-			"invalid precomputed reward pot %d below fees %d",
-			totalRewardPot,
-			fees,
-		)
-	}
-	availableRewards, err := rewardAvailableRewards(
-		app.TotalRewardPot,
-		app.Params,
-	)
-	if err != nil {
-		return err
-	}
-	app.AvailableRewards = availableRewards
-	app.EffectiveRewards = 0
-	app.Unspendable = 0
+	outputs := make([]RewardOutputAmount, 0, len(app.AccountOutputs))
 	for _, output := range app.AccountOutputs {
 		if output == nil {
 			continue
 		}
-		// CIP-0163 guard: an output whose reward account is expired as of the
-		// snapshot epoch is neither credited nor counted here, so its amount
-		// falls through to undistributed (see undistributed below) and is
-		// refunded to reserves. This must match the crediting loop's skip in
-		// ApplyStakeRewardApplication exactly. The set is nil unless the gate
-		// was on at application time, keeping the gate-off path byte-identical.
-		if rewardOutputGuarded(app, output) {
-			continue
-		}
-		amount := uint64(output.Amount)
-		var overflow bool
-		if output.Spendable {
-			app.EffectiveRewards, overflow = AddRewardUint64(
-				app.EffectiveRewards,
-				amount,
-			)
-		} else {
-			app.Unspendable, overflow = AddRewardUint64(app.Unspendable, amount)
-		}
-		if overflow {
-			return errors.New("stake reward output total overflow")
-		}
+		outputs = append(outputs, RewardOutputAmount{
+			Amount:    uint64(output.Amount),
+			Spendable: output.Spendable,
+			Guarded:   rewardOutputGuarded(app, output),
+		})
 	}
-	credited, overflow := AddRewardUint64(
-		app.EffectiveRewards,
-		app.Unspendable,
-	)
-	var undistributed uint64
-	if !overflow {
-		undistributed, err = rewards.UndistributedRewards(
-			app.AvailableRewards,
-			credited,
-			app.UnspendableDeficit,
-		)
+	totals, err := ComputeRewardTotals(RewardTotalsInput{
+		TotalRewardPot:     app.TotalRewardPot,
+		Fees:               uint64(app.Pots.Fees),
+		TreasuryExpansion:  app.Params.TreasuryExpansion,
+		UnspendableDeficit: app.UnspendableDeficit,
+		Outputs:            outputs,
+	})
+	if err != nil {
+		return err
 	}
-	if overflow || err != nil {
-		return fmt.Errorf(
-			"precomputed rewards exceed available pot: effective=%d unspendable=%d deficit=%d available=%d",
-			app.EffectiveRewards,
-			app.Unspendable,
-			app.UnspendableDeficit,
-			app.AvailableRewards,
-		)
-	}
-	app.Undistributed = undistributed
+	app.AvailableRewards = totals.AvailableRewards
+	app.EffectiveRewards = totals.EffectiveRewards
+	app.Unspendable = totals.Unspendable
+	app.Undistributed = totals.Undistributed
 	return nil
 }
 
@@ -2918,57 +2875,21 @@ func StakeRewardUpdatedPots(
 	if err := deriveStakeRewardApplicationTotals(app); err != nil {
 		return 0, 0, err
 	}
-	incentives := app.TotalRewardPot - uint64(app.Pots.Fees)
-	if uint64(app.Pots.Reserves) < incentives {
-		return 0, 0, fmt.Errorf(
-			"stake reward incentives %d exceed reserves %d",
-			incentives,
-			app.Pots.Reserves,
-		)
-	}
 	basePots := app.Pots
 	if app.ReplayBaseline != nil {
 		basePots = app.ReplayBaseline
 	}
-	if uint64(basePots.Reserves) < incentives {
-		return 0, 0, fmt.Errorf(
-			"stake reward incentives %d exceed reserves %d",
-			incentives,
-			basePots.Reserves,
-		)
-	}
-	reserves := uint64(basePots.Reserves) - incentives
-	var overflow bool
-	reserves, overflow = AddRewardUint64(reserves, app.Undistributed)
-	if overflow {
-		return 0, 0, errors.New("stake reward reserves overflow")
-	}
-	treasuryTax, err := rewardFloorMul(
-		app.Params.TreasuryExpansion,
-		app.TotalRewardPot,
-	)
-	if err != nil {
-		return 0, 0, fmt.Errorf("stake reward treasury tax: %w", err)
-	}
-	treasury, overflow := AddRewardUint64(
-		uint64(basePots.Treasury),
-		treasuryTax,
-	)
-	if overflow {
-		return 0, 0, errors.New("stake reward treasury tax overflow")
-	}
-	treasury, overflow = AddRewardUint64(treasury, app.Unspendable)
-	if overflow {
-		return 0, 0, errors.New("stake reward treasury overflow")
-	}
-	treasury, err = rewards.SubtractUnspendableDeficit(
-		treasury,
-		app.UnspendableDeficit,
-	)
-	if err != nil {
-		return 0, 0, err
-	}
-	return reserves, treasury, nil
+	return ComputeUpdatedPots(UpdatedPotsInput{
+		TotalRewardPot:     app.TotalRewardPot,
+		Fees:               uint64(app.Pots.Fees),
+		PotsReserves:       uint64(app.Pots.Reserves),
+		BaseReserves:       uint64(basePots.Reserves),
+		BaseTreasury:       uint64(basePots.Treasury),
+		Undistributed:      app.Undistributed,
+		Unspendable:        app.Unspendable,
+		UnspendableDeficit: app.UnspendableDeficit,
+		TreasuryExpansion:  app.Params.TreasuryExpansion,
+	})
 }
 
 func rewardFloorMul(r *big.Rat, amount uint64) (uint64, error) {
@@ -4059,23 +3980,11 @@ func (e *Engine) RewardPrefilterSlot(
 	if epoch == nil {
 		return 0, fmt.Errorf("reward prefilter epoch %d not found", potsEpoch)
 	}
-	if epoch.LengthInSlots == 0 {
-		return epoch.StartSlot, nil
-	}
-	endSlot := epoch.StartSlot + uint64(epoch.LengthInSlots) - 1
-	stabilityWindow := e.RewardUpdateStabilityWindow()
-	prefilterSlot := epoch.StartSlot
-	if stabilityWindow > 0 {
-		if stabilityWindow >= math.MaxUint64-epoch.StartSlot {
-			prefilterSlot = endSlot
-		} else {
-			prefilterSlot = epoch.StartSlot + stabilityWindow + 1
-		}
-	}
-	if prefilterSlot > endSlot {
-		prefilterSlot = endSlot
-	}
-	return prefilterSlot, nil
+	return ComputeRewardPrefilterSlot(
+		epoch.StartSlot,
+		uint64(epoch.LengthInSlots),
+		e.RewardUpdateStabilityWindow(),
+	), nil
 }
 
 // RewardUpdateStabilityWindow returns the randomness stabilisation window used
@@ -4157,40 +4066,15 @@ func (e *Engine) rewardCalculatorSnapshot(
 	if err != nil {
 		return rewards.Snapshot{}, err
 	}
-	stakeByPool := make(map[string][]*models.RewardStakeInput)
-	for _, input := range stakeInputs {
-		if input == nil {
-			continue
-		}
-		stakeByPool[string(input.PoolKeyHash)] = append(
-			stakeByPool[string(input.PoolKeyHash)],
-			input,
-		)
-	}
-
-	ret := rewards.Snapshot{
-		TotalActiveStake:    uint64(snapshot.TotalActiveStake),
-		ExcludedActiveStake: (*uint64)(snapshot.ExcludedActiveStake),
-		Pools:               make([]rewards.Pool, 0, len(poolInputs)),
-	}
-	for _, input := range poolInputs {
-		if input == nil {
-			continue
-		}
-		pool, err := rewardPoolFromInput(
-			input,
-			stakeByPool[string(input.PoolKeyHash)],
-			activeAccounts,
-			prefilterAccounts,
-			blockCounts[string(input.PoolKeyHash)],
-			totalBlocks,
-		)
-		if err != nil {
-			return rewards.Snapshot{}, err
-		}
-		ret.Pools = append(ret.Pools, pool)
-	}
-	return ret, nil
+	return assembleRewardSnapshot(RewardSnapshotInput{
+		Snapshot:          snapshot,
+		PoolInputs:        poolInputs,
+		StakeInputs:       stakeInputs,
+		BlockCounts:       blockCounts,
+		TotalBlocks:       totalBlocks,
+		ActiveAccounts:    activeAccounts,
+		PrefilterAccounts: prefilterAccounts,
+	})
 }
 
 func ValidateRewardCalculatorInputs(
