@@ -125,71 +125,35 @@ func (cs *ChainSelector) genesisDensityDisconnectsLocked() []GenesisDensityDisco
 	window := cs.genesisWindowSlotsLocked()
 	candidates := cs.densityCandidatesLocked()
 
-	var out []GenesisDensityDisconnect
-	for i := range candidates {
-		b := candidates[i]
-		for j := range candidates {
-			if i == j {
-				continue
-			}
-			a := candidates[j]
-			if _, done := cs.genesisDensityDisconnected[a.connId]; done {
-				continue
-			}
-			intersection, ok := intersectPointFrontiers(
-				a.points,
-				a.baseBlock,
-				b.points,
-				b.baseBlock,
-			)
-			if !ok ||
-				intersection.Slot == a.points[len(a.points)-1].Slot ||
-				intersection.Slot == b.points[len(b.points)-1].Slot {
-				continue
-			}
-			windowEnd := safeAddUint64(intersection.Slot, window)
-			dominating, _ := fragmentWindowBounds(
-				a.points, intersection.Slot, windowEnd,
-			)
-			minDensity, maxDensity := fragmentWindowBounds(
-				b.points, intersection.Slot, windowEnd,
-			)
-			rivalStart := sort.Search(len(a.points), func(i int) bool {
-				return a.points[i].Slot > intersection.Slot
-			})
-			// #nosec G115 -- rivalStart is an index within a.points.
-			rivalBlocks := uint64(len(a.points) - rivalStart)
-			offersMoreThanK := rivalBlocks > cs.securityParam
-			if !offersMoreThanK && minDensity != maxDensity {
-				continue
-			}
-			comparisonBound := maxDensity
-			if b.idling {
-				comparisonBound = minDensity
-			}
-			if dominating < comparisonBound {
-				continue
-			}
-			// Mark now rather than after the pass: density is compared at
-			// each pair's own intersection and is not transitive, so a peer
-			// reported in this pass must not serve as a rival for a later
-			// one, or a cycle could report every candidate.
-			if cs.genesisDensityDisconnected == nil {
-				cs.genesisDensityDisconnected = make(
-					map[ouroboros.ConnectionId]struct{},
-				)
-			}
-			cs.genesisDensityDisconnected[b.connId] = struct{}{}
-			out = append(out, GenesisDensityDisconnect{
-				ConnectionId:           b.connId,
-				DominatingConnectionId: a.connId,
-				Intersection:           intersection,
-				WindowSlots:            window,
-				DominatingDensity:      dominating,
-				MaxDensity:             comparisonBound,
-			})
-			break
+	peers := make([]GenesisDensityPeer, len(candidates))
+	byID := make(map[string]densityCandidate, len(candidates))
+	for i, c := range candidates {
+		id := c.connId.String()
+		peers[i] = GenesisDensityPeer{
+			ID:        id,
+			Points:    c.points,
+			BaseBlock: c.baseBlock,
+			Idling:    c.idling,
 		}
+		byID[id] = c
+	}
+	disconnected := make(map[string]struct{}, len(cs.genesisDensityDisconnected))
+	for connId := range cs.genesisDensityDisconnected {
+		disconnected[connId.String()] = struct{}{}
+	}
+	var out []GenesisDensityDisconnect
+	for _, loser := range FindGenesisDensityLosers(
+		peers, window, cs.securityParam, disconnected,
+	) {
+		cs.markDensityDisconnectedLocked(byID[loser.ID].connId)
+		out = append(out, GenesisDensityDisconnect{
+			ConnectionId:           byID[loser.ID].connId,
+			DominatingConnectionId: byID[loser.DominatingID].connId,
+			Intersection:           loser.Intersection,
+			WindowSlots:            loser.WindowSlots,
+			DominatingDensity:      loser.DominatingDensity,
+			MaxDensity:             loser.MaxDensity,
+		})
 	}
 	return append(
 		out,
